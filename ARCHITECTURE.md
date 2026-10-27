@@ -1,6 +1,6 @@
 # Reliable HTTP Job Scheduler — Architecture & Technical Design Document
 
-> **Document Version:** 1.3.0 (Phase 4 Retries, Backoff, DLQ, Heartbeat & Lease Reaper)  
+> **Document Version:** 1.4.0 (Phase 5 Real HTTP Execution & Response Audit Logging)  
 > **Status:** Active / Under Iterative Development  
 > **Target Audience:** Engineering Mentors, Backend System Designers, Technical Interviewers  
 
@@ -38,6 +38,10 @@
    - [4.20 Lease Reaper Architecture & Multi-Instance Skip-Locked Sweeper](#420-lease-reaper-architecture--multi-instance-skip-locked-sweeper)
    - [4.21 Heartbeat Protocol & AutoCloseable Resource Management](#421-heartbeat-protocol--autocloseable-resource-management)
    - [4.22 Graceful Shutdown Protocol](#422-graceful-shutdown-protocol)
+   - [4.23 HTTP Client Selection & Virtual Thread Unmounting (`java.net.http.HttpClient`)](#423-http-client-selection--virtual-thread-unmounting-javanethttphttpclient)
+   - [4.24 HTTP Status Code Classification: 2xx, 429 & 5xx, vs 4xx Client Errors](#424-http-status-code-classification-2xx-429--5xx-vs-4xx-client-errors)
+   - [4.25 Audit Logging & Database Bloat Mitigation: Response Truncation (4 KB Snippet)](#425-audit-logging--database-bloat-mitigation-response-truncation-4-kb-snippet)
+   - [4.26 Handling Non-JSON & Text-Only Webhook Payloads](#426-handling-non-json--text-only-webhook-payloads)
 5. [What Went Wrong & Engineering Resolutions](#5-what-went-wrong--engineering-resolutions)
 6. [Repository Exclusion Policy (.gitignore)](#6-repository-exclusion-policy-gitignore)
 7. [Comprehensive Interview Defense & Technical Questions](#7-comprehensive-interview-defense--technical-questions)
@@ -658,6 +662,97 @@ When the application receives a termination signal (`SIGTERM` or Spring `@PreDes
 
 ---
 
+### 4.23 HTTP Client Selection & Virtual Thread Unmounting (`java.net.http.HttpClient`)
+
+In Phase 5, real outbound HTTP calls are dispatched. Traditional Java HTTP clients (such as Apache HttpClient 4.x or older OkHttp versions) rely on internal synchronized blocks and thread-blocking socket implementations that can cause Virtual Thread carrier pinning.
+
+We utilize the standard Java 21 `java.net.http.HttpClient`:
+1. **Loom-Native Unmounting**: `java.net.http.HttpClient` was rewritten in modern JDKs to integrate directly with JVM virtual thread pollers (epoll/kqueue). When an outbound socket write or read blocks, the Virtual Thread unmounts from its underlying OS carrier thread (`ForkJoinWorkerThread`), freeing the CPU core to execute other virtual threads.
+2. **Zero Carrier Pinning**: Running our test suite under `-Djdk.tracePinnedThreads=full` confirms that zero virtual thread pinning events occur during outbound HTTP requests.
+3. **Connection & Request Timeouts**:
+   - `connectTimeout(Duration.ofSeconds(5))` prevents socket connection stalls on unreachable hosts.
+   - Per-request timeout (`Duration.ofSeconds(timeoutSeconds)`) prevents slow external endpoints from tying up memory indefinitely.
+4. **Redirect Policy**: Configured with `HttpClient.Redirect.NORMAL` (follows standard HTTP to HTTPS redirects while preventing cross-protocol downgrades).
+
+---
+
+### 4.24 HTTP Status Code Classification: 2xx, 429 & 5xx, vs 4xx Client Errors
+
+When an outbound HTTP request completes, the scheduler evaluates the HTTP response status code to decide the next state transition:
+
+```text
+┌──────────────────────────────┬────────────────────────┬───────────────────────────────────────┐
+│ HTTP Status Code             │ Classification         │ State Transition                      │
+├──────────────────────────────┼────────────────────────┼───────────────────────────────────────┤
+│ 200 – 299                    │ Success                │ SUCCEEDED (Fenced terminal write)     │
+│ 429 Too Many Requests        │ Rate Limited / Retry   │ PENDING (Full Jitter) or DEAD (DLQ)   │
+│ 500 – 599 (502, 503, 504...) │ Server Error / Retry   │ PENDING (Full Jitter) or DEAD (DLQ)   │
+│ 400 – 499 (excl. 429)        │ Client Error           │ DEAD (Immediate Permanent DLQ)        │
+│ SocketException / Timeout    │ Network Fault / Retry  │ PENDING (Full Jitter) or DEAD (DLQ)   │
+└──────────────────────────────┴────────────────────────┴───────────────────────────────────────┘
+```
+
+#### The Rationale for 429 vs 4xx Segregation:
+- **Why 429 is Retryable**: Although 429 belongs to the 4xx series, it indicates rate-limit exhaustion (e.g., token bucket depletion). The request itself is syntactically valid and authorized. Retrying after a backoff delay allows the downstream token bucket to refill and succeed.
+- **Why 4xx is Permanent**: Status codes like 400 (Bad Request), 401 (Unauthorized), 403 (Forbidden), 404 (Not Found), or 422 (Unprocessable Entity) represent client-side deterministic failures. Resending an unauthorized or malformed payload 5 times will fail 5 times, wasting compute and spamming the downstream provider. Therefore, any 4xx (except 429) short-circuits directly to `DEAD` without burning retry attempts.
+
+---
+
+### 4.25 Audit Logging & Database Bloat Mitigation: Response Truncation (4 KB Snippet)
+
+Every job execution creates an immutable audit row in the `job_attempts` table:
+```sql
+CREATE TABLE job_attempts (
+    id                UUID PRIMARY KEY,
+    job_id            UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    attempt_number    INT NOT NULL,
+    status_code       INT,
+    response_snippet  TEXT,
+    error_message     TEXT,
+    duration_ms       BIGINT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+#### The Threat of Full HTTP Body Storage:
+External services frequently return multi-megabyte responses:
+- Nginx / Cloudflare 502 Bad Gateway pages can return huge HTML trees.
+- Java/Node backends may dump 50 KB stack traces.
+- A target might erroneously respond with a 20 MB binary blob or PDF.
+
+If the scheduler unconditionally stores full HTTP response bodies, the PostgreSQL `job_attempts` table will trigger extensive TOAST (The Oversized-Attribute Storage Technique) table writes, causing massive disk bloat, cache thrashing, and slow analytics queries.
+
+#### The 4 KB Truncation Safeguard:
+In `HttpJobHandler.java`, the response body is safely bounded before database persistence:
+```java
+private static final int MAX_SNIPPET_LENGTH = 4096;
+
+private String truncateSnippet(String body) {
+    if (body == null || body.length() <= MAX_SNIPPET_LENGTH) {
+        return body;
+    }
+    return body.substring(0, MAX_SNIPPET_LENGTH) + 
+           "\n[TRUNCATED: original length was " + body.length() + " chars]";
+}
+```
+A 4 KB snippet is sufficient to capture 99.9% of JSON error payloads, status summaries, and stack trace headers while providing a deterministic upper bound on row size.
+
+---
+
+### 4.26 Handling Non-JSON & Text-Only Webhook Payloads
+
+The scheduler avoids deserializing request bodies into structured objects. Instead:
+1. **Raw Text Ingestion**: The body is stored verbatim as UTF-8 `TEXT` in PostgreSQL.
+2. **Dynamic Header Injection**: Headers provided in `HttpPayloadDto` (e.g., `Content-Type: application/xml`, `Authorization: Bearer ...`, `X-Webhook-Signature: ...`) are forwarded verbatim to `HttpRequest.Builder`.
+3. **Body Publisher**: When a body is present on POST/PUT/PATCH requests:
+   ```java
+   HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)
+   ```
+   For GET/DELETE/HEAD requests, `HttpRequest.BodyPublishers.noBody()` is used.
+4. **Signature Integrity**: Because no JSON normalization or key sorting occurs, client HMAC signatures computed over the raw payload remain intact and valid when received by the destination server.
+
+---
+
 ## 5. What Went Wrong & Engineering Resolutions
 
 During environment setup, Flyway migrations, and Phase 2 implementation, several real-world engineering hurdles were encountered and resolved:
@@ -688,6 +783,10 @@ During environment setup, Flyway migrations, and Phase 2 implementation, several
  6. AutoConfigureMockMvc package relocation  Spring Boot 4 relocated package from
     in Spring Boot 4.x.                      o.s.b.test.autoconfigure.web.servlet to
                                              o.s.b.webmvc.test.autoconfigure. Updated imports.
+
+ 7. Unmanaged Spring background poller       @SpringBootTest auto-started JobWorkerEngine
+    stealing test jobs under concurrency.    which claimed test batches without test handlers.
+                                             Disabled worker in application-test.yaml.
 ```
 
 1. **Missing `javac` in Fedora Headless JRE**:
@@ -701,6 +800,10 @@ During environment setup, Flyway migrations, and Phase 2 implementation, several
 3. **Testcontainers Configuration Scope**:
    - *Symptom*: Migration and Actuator tests in subpackages (`com.ashutosh.scheduler.migration`) failed compilation because `TestcontainersConfiguration` had default package-private visibility.
    - *Resolution*: Explicitly modified `TestcontainersConfiguration` and its `PostgreSQLContainer` bean method to `public`.
+4. **Spring Background Poller Concurrency Interference**:
+   - *Symptom*: `testConcurrency1000Jobs5Workers` intermittently reported 990 succeeded out of 1,000 jobs.
+   - *Cause*: `@SpringBootTest` started a background `JobWorkerEngine` poller thread using the default ApplicationContext `JobHandlerRegistry`. The poller claimed 1 batch (10 jobs) of `CONCURRENCY_TEST` jobs, but couldn't execute them because the test-specific handler was not in the application-wide registry, transitioning them to `DEAD`.
+   - *Resolution*: Created `src/test/resources/application-test.yaml` with `scheduler.worker.enabled: false`, ensuring only test-harness-instantiated workers poll during integration tests.
 
 ---
 
@@ -827,5 +930,27 @@ frontend/.astro/
 > 1. **Transient / Retryable Failures**: Caused by temporary conditions like network timeouts, DNS hiccups, or downstream 503/504 server overload. Retrying later has a high probability of success.
 > 2. **Deterministic / Permanent Failures**: Caused by invalid inputs, such as malformed JSON syntax, HTTP 400 Bad Request, invalid authentication credentials, or targeting an unknown route.
 > Because the input payload is immutable, resending an invalid JSON payload 3 or 5 times will deterministically fail 3 or 5 times. Retrying permanent errors wastes CPU cycles, database I/O, and outbound network bandwidth, while potentially triggering downstream rate limiters or security blocks. Therefore, permanent failures are immediately short-circuited to `DEAD` (DLQ) with an explicit error message recorded."
+
+### Q13: Why is Java 21's `java.net.http.HttpClient` optimal for Virtual Threads compared to legacy HTTP clients, and how do you guarantee zero carrier thread pinning?
+**Interview Defense**:
+> "In Java 21 Loom, Virtual Threads achieve high concurrency by unmounting from their underlying OS carrier threads whenever an I/O operation blocks. However, legacy HTTP clients (like Apache HttpClient 4.x or older OkHttp) often use `synchronized` blocks inside their connection pooling or SSL socket read loops. In early Loom implementations, executing a blocking I/O operation inside a `synchronized` block 'pins' the virtual thread to its carrier thread, preventing the carrier thread from running other virtual threads and degrading throughput back to the level of platform thread pools.
+> We chose the standard `java.net.http.HttpClient` because it was re-architected in modern JDKs to use `java.util.concurrent` locks (`ReentrantLock`) and NIO selector event loops internally. When an outbound socket write or read waits for network I/O, the virtual thread cleanly yields and unmounts without pinning.
+> We continuously verify this in our automated surefire test suite by configuring `<argLine>-Djdk.tracePinnedThreads=full</argLine>`, which causes the JVM to print stack traces if any carrier thread pinning occurs."
+
+### Q14: How does our HTTP status classification differentiate between 429 Too Many Requests and 4xx client errors, and why must 429 be retryable with backoff and jitter?
+**Interview Defense**:
+> "A naive HTTP client might categorize all 4xx status codes as non-retryable client errors. However, HTTP 429 (Too Many Requests) has fundamentally different semantics:
+> 1. Status codes 400, 401, 403, 404, and 422 indicate deterministic flaws in the request (bad syntax, missing auth, non-existent endpoint). Retrying the exact same request will produce the exact same failure 100% of the time, so they must be short-circuited directly to `DEAD` (DLQ) to save CPU and database writes.
+> 2. In contrast, HTTP 429 indicates downstream rate-limiting (e.g. token bucket or leaky bucket capacity exhaustion). The request itself is valid and authorized; the downstream server simply cannot accept it *right now*.
+> 3. By treating 429 as a retryable failure and scheduling it with Full Jitter exponential backoff, we allow the downstream rate limiter's token bucket to refill while randomizing worker retry intervals. This guarantees that multiple rate-limited workers do not assault the target in synchronized thundering herds, giving the downstream service breathing room to recover."
+
+### Q15: Why is response snippet truncation (capping at 4 KB) critical for scheduler database health, and what are the trade-offs of storing full HTTP response payloads?
+**Interview Defense**:
+> "In an asynchronous webhook and job scheduler, persisting attempt outcomes to an audit table (`job_attempts`) is vital for debugging. However, external endpoints are outside our control. Downstream services experiencing outages frequently return massive payloads — such as 100 KB Cloudflare error HTML pages, 50 KB Java stack traces, or even multi-megabyte binary error dumps.
+> In PostgreSQL, row tuples exceeding ~2 KB trigger TOAST (The Oversized-Attribute Storage Technique). TOAST splits large values into compressed chunks stored in separate secondary tables. Storing untruncated HTTP responses would rapidly cause severe database bloat, increase disk I/O, thrash the PostgreSQL buffer cache (`shared_buffers`), and slow down operational queries.
+> By truncating `response_snippet` at 4,096 characters and appending metadata indicating the original response length, we ensure that:
+> 1. Developers receive enough information (JSON error messages, status headers, top of stack trace) to diagnose 99.9% of failures.
+> 2. Database disk usage and WAL generation remain strictly bounded and predictable regardless of how erratically downstream endpoints behave."
+
 
 

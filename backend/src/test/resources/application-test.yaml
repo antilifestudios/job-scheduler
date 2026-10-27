@@ -1,0 +1,5 @@
+scheduler:
+  worker:
+    enabled: false
+    reaper-enabled: true
+    reaper-interval-ms: 3600000
