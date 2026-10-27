@@ -3,3 +3,4 @@ scheduler:
     enabled: false
     reaper-enabled: true
     reaper-interval-ms: 3600000
+    ssrf-allow-private-ips: true

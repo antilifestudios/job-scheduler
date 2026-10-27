@@ -19,6 +19,14 @@ public class WorkerProperties {
     private long reaperIntervalMs = 10000;
     private int reaperBatchSize = 50;
     private int shutdownTimeoutSeconds = 15;
+    private boolean ssrfEnabled = true;
+    private boolean ssrfAllowPrivateIps = false;
+
+    public boolean isSsrfEnabled() { return ssrfEnabled; }
+    public void setSsrfEnabled(boolean ssrfEnabled) { this.ssrfEnabled = ssrfEnabled; }
+
+    public boolean isSsrfAllowPrivateIps() { return ssrfAllowPrivateIps; }
+    public void setSsrfAllowPrivateIps(boolean ssrfAllowPrivateIps) { this.ssrfAllowPrivateIps = ssrfAllowPrivateIps; }
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }

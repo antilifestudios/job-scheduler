@@ -1,6 +1,6 @@
 # Reliable HTTP Job Scheduler — Architecture & Technical Design Document
 
-> **Document Version:** 1.4.0 (Phase 5 Real HTTP Execution & Response Audit Logging)  
+> **Document Version:** 1.5.0 (Phase 6 SSRF Hardening, DNS Pinning & Wire Validation)  
 > **Status:** Active / Under Iterative Development  
 > **Target Audience:** Engineering Mentors, Backend System Designers, Technical Interviewers  
 
@@ -42,6 +42,10 @@
    - [4.24 HTTP Status Code Classification: 2xx, 429 & 5xx, vs 4xx Client Errors](#424-http-status-code-classification-2xx-429--5xx-vs-4xx-client-errors)
    - [4.25 Audit Logging & Database Bloat Mitigation: Response Truncation (4 KB Snippet)](#425-audit-logging--database-bloat-mitigation-response-truncation-4-kb-snippet)
    - [4.26 Handling Non-JSON & Text-Only Webhook Payloads](#426-handling-non-json--text-only-webhook-payloads)
+   - [4.27 OkHttp Migration & Single-Resolution DNS Pinning Invariant (`okhttp3.Dns`)](#427-okhttp-migration--single-resolution-dns-pinning-invariant-okhttp3dns)
+   - [4.28 OkHttp Network Interceptor Wire Guard for IP-Literal Hosts](#428-okhttp-network-interceptor-wire-guard-for-ip-literal-hosts)
+   - [4.29 Authoritative Default-Deny IP Range Engine & IPv6 2000::/3 Space](#429-authoritative-default-deny-ip-range-engine--ipv6-20003-space)
+   - [4.30 Secure Manual Redirect Loop, Cross-Origin Header Stripping & Port Allowlist](#430-secure-manual-redirect-loop-cross-origin-header-stripping--port-allowlist)
 5. [What Went Wrong & Engineering Resolutions](#5-what-went-wrong--engineering-resolutions)
 6. [Repository Exclusion Policy (.gitignore)](#6-repository-exclusion-policy-gitignore)
 7. [Comprehensive Interview Defense & Technical Questions](#7-comprehensive-interview-defense--technical-questions)
@@ -753,6 +757,122 @@ The scheduler avoids deserializing request bodies into structured objects. Inste
 
 ---
 
+### 4.27 OkHttp Migration & Single-Resolution DNS Pinning Invariant (`okhttp3.Dns`)
+
+In Phase 5, outbound HTTP execution utilized the standard Java 21 `java.net.http.HttpClient`. However, standard JDK `HttpClient` exhibits a fatal security limitation when exposed to untrusted user-supplied destination URLs:
+- **No Pluggable DNS SPI**: `java.net.http.HttpClient` does not expose a public API to inject custom DNS resolution.
+- **DNS Rebinding (TOCTOU Vulnerability)**: If application code resolves a hostname before calling `client.send()`, the JDK `HttpClient` resolves the domain **a second time** internally during socket connect. An attacker with a custom DNS server (`TTL=0`) can return a public IP during pre-resolution and return `127.0.0.1` or `169.254.169.254` (AWS IMDS) during the client's internal connect resolution, completely bypassing pre-flight checks.
+
+To establish robust protection against DNS rebinding, the scheduler migrated to **Square OkHttp (`com.squareup.okhttp3:okhttp:4.12.0`)**:
+1. **The Single-Resolution & Hook Invariant**:
+   > **Core Security Invariant:**  
+   > *Every lookup used for a connection is validated and no path resolves outside the hook.*
+2. **Pluggable `okhttp3.Dns`**: OkHttp delegates hostname resolution to an instance of `okhttp3.Dns`. In our implementation, `SsrfAwareDns` resolves the hostname via our pluggable `DnsResolver` with a bounded 5-second timeout (`CompletableFuture.supplyAsync(..., executor).get(5, TimeUnit.SECONDS)`).
+3. **Authoritative Resolution Validation**: Every returned `InetAddress` is evaluated against our authoritative default-deny IP rules. If *any* address in the list violates policy, an `UnknownHostException` is immediately thrown, aborting socket initiation before a single SYN packet leaves the host.
+4. **Virtual Thread Unmounting**: OkHttp synchronous execution (`call.execute()`) runs cleanly inside Java 21 Virtual Threads without carrier thread pinning, verified under `-Djdk.tracePinnedThreads=full`.
+5. **Transitive Dependency Footprint**: Incorporating `com.squareup.okhttp3:okhttp:4.12.0` introduces `org.jetbrains.kotlin:kotlin-stdlib` and `com.squareup.okio:okio` to the classpath. Both dependencies are well-maintained, battle-tested, and audited.
+
+---
+
+### 4.28 OkHttp Network Interceptor Wire Guard for IP-Literal Hosts
+
+An in-depth code audit of OkHttp's internal routing engine (`RouteSelector.kt`) revealed a critical subtlety:
+```kotlin
+// OkHttp RouteSelector internal logic:
+if (socketHost.canParseAsIpAddress()) {
+    listOf(InetAddress.getByName(socketHost))
+} else {
+    address.dns.lookup(socketHost)
+}
+```
+When an HTTP request targets a raw IP literal (e.g. `http://127.0.0.1/` or `http://[::1]/`), OkHttp **bypasses `Dns.lookup()` entirely**.
+
+To close any potential hook gap with absolute certainty:
+1. **Fast-Fail Syntax Validation**: `SsrfValidator.validateUrl` rejects literal IPs, non-HTTP schemes, userinfo (`@`), backslashes (`\`), fragments (`#`), and non-standard decimal/hex/octal encodings during ingestion and pre-execution string inspection.
+2. **Authoritative Wire-Level Validation (`SsrfNetworkInterceptor`)**:
+   - Added via `OkHttpClient.Builder.addNetworkInterceptor(...)`.
+   - The network interceptor runs **after the TCP socket is connected and TLS handshake is established**, but **before a single byte of HTTP request data (headers or body) is written to the wire**.
+   - It inspects the actual connected socket:
+     ```java
+     InetAddress connectedAddress = chain.connection().socket().getInetAddress();
+     ssrfValidator.validateInetAddress(connectedAddress);
+     ```
+   - If the connected address resolves to a loopback, cloud metadata, or private IP, the interceptor immediately aborts the connection and throws `SsrfException`.
+   - Authoritative security checks are performed strictly on `InetAddress` objects; string checks are fast-fail only.
+
+---
+
+### 4.29 Authoritative Default-Deny IP Range Engine & IPv6 2000::/3 Space
+
+The IP filtering engine (`SsrfValidator`) implements a strict **Default-Deny** security posture: outbound connections are permitted **only** to routable Global Unicast Addresses.
+
+#### IPv4 Restricted Subnets (14 Blocks)
+1. `0.0.0.0/8` — Current network / Software broadcast (RFC 1122)
+2. `10.0.0.0/8` — Private network (RFC 1918)
+3. `100.64.0.0/10` — Shared Address Space / CGNAT (RFC 6598)
+4. `127.0.0.0/8` — Loopback (RFC 1122)
+5. `169.254.0.0/16` — Link-Local / Cloud Metadata (RFC 3927, AWS/GCP/Azure IMDS)
+6. `172.16.0.0/12` — Private network (RFC 1918)
+7. `192.0.0.0/24` — IETF Protocol Assignments (RFC 6890)
+8. `192.0.2.0/24` — TEST-NET-1 Documentation (RFC 5737)
+9. `192.168.0.0/16` — Private network (RFC 1918)
+10. `198.18.0.0/15` — Benchmarking (RFC 2544)
+11. `198.51.100.0/24` — TEST-NET-2 Documentation (RFC 5737)
+12. `203.0.113.0/24` — TEST-NET-3 Documentation (RFC 5737)
+13. `224.0.0.0/4` — Multicast (RFC 5771)
+14. `240.0.0.0/4` — Reserved / Class E (RFC 1112)
+15. `255.255.255.255/32` — Limited Broadcast (RFC 919)
+
+#### IPv6 Global Unicast (`2000::/3`) and Subnet Exceptions
+- **Permitted Range**: Only addresses residing within `2000::/3` (Global Unicast Address space, high binary bits `001...`) are permitted. All others (`::/128`, `::1/128`, `fc00::/7` ULA, `fe80::/10` link-local, `ff00::/8` multicast) are rejected.
+- **Carved-Out Subnet Exceptions**:
+  - `::ffff:0:0/96` (IPv4-mapped IPv6): Unpacked to raw 4-byte IPv4 addresses and validated against the IPv4 denylist (e.g. `[::ffff:127.0.0.1]` and `[::ffff:169.254.169.254]` are rejected).
+  - `64:ff9b::/96` (IPv4/IPv6 translation, RFC 6052)
+  - `2001::/32` (Teredo tunneling, RFC 4380)
+  - `2001:db8::/32` (Documentation, RFC 3849)
+  - `2002::/16` (6to4 tunneling, RFC 3056)
+  - `fc00::/7` (Unique Local Address - ULA, RFC 4193)
+  - `fe80::/10` (Link-Local Unicast, RFC 4291)
+  - `ff00::/8` (Multicast, RFC 4291)
+
+#### Fail-Fast Startup Guard
+To prevent accidental misconfiguration in staging or production environments, `SsrfValidator` enforces a fail-fast `@PostConstruct` startup check:
+```java
+if (ssrfAllowPrivateIps && !isDevOrTestProfileActive()) {
+    throw new IllegalStateException("FATAL: scheduler.worker.ssrf-allow-private-ips=true is strictly forbidden outside dev/test profiles!");
+}
+```
+
+---
+
+### 4.30 Secure Manual Redirect Loop, Cross-Origin Header Stripping & Port Allowlist
+
+#### Manual Redirect Engine (Max 5 Hops)
+Automatic redirect following is disabled in OkHttp (`followRedirects(false)`, `followSslRedirects(false)`). All redirects are processed via a manual loop in `HttpJobHandler`:
+1. **Cumulative Total Deadline**: Per-hop timeouts derive from the remaining cumulative deadline:
+   $$\text{timeout}_{\text{hop}} = \text{deadlineNanos} - \text{System.nanoTime()}$$
+   If any hop exhausts the remaining budget, execution aborts with a timeout.
+2. **HTTPS to HTTP Downgrade Block**: Redirects from `https://` to `http://` are forbidden to prevent downgrade attacks and credential exposure in cleartext.
+3. **Cross-Origin Header Stripping**: When a redirect crosses origins (different scheme, host, or port), all user-supplied headers (e.g., `Authorization`, `X-Api-Key`, custom session tokens) are **stripped**, preserving only safe metadata:
+   - `Content-Type`
+   - `Accept`
+   - `User-Agent`
+4. **RFC 9110 Method Mutation**:
+   - `301 Moved Permanently`, `302 Found`, and `303 See Other` mutate the request method to `GET` and drop the request body.
+   - `307 Temporary Redirect` and `308 Permanent Redirect` preserve the original HTTP method and verbatim body payload.
+
+#### Port Policy & Abuse Trade-off
+Outbound connections are restricted to an explicit port allowlist: **80, 443, 8080, 8443**.
+- **Security Trade-off**: Allowing arbitrary outbound ports (e.g., 22, 5432, 6379, 9000, 27017) enables attackers to utilize the scheduler as an internal port-scanner or protocol-confusion weapon (interfacing with raw TCP services like Redis or Memcached). Restricting ports strictly to standard web ports eliminates non-HTTP protocol confusion while serving standard webhook destinations.
+
+#### Response Read Byte Cap & Generic Error Responses
+- **Response Stream Cap**: Responses are read up to a hard limit of **64 KB (65,536 bytes)** before truncation into a 4 KB audit snippet. This prevents malicious servers from streaming infinite data or gzip-bombs into memory.
+- **Generic User-Facing Error**: When an SSRF violation or network interceptor block occurs, the external attempt record and API status reflect:
+  `"Destination host is not reachable or request rejected"`
+  Internal IP details, blocked CIDR ranges, and stack traces are logged exclusively to internal server logs to deny attackers an oracle for network discovery.
+
+---
+
 ## 5. What Went Wrong & Engineering Resolutions
 
 During environment setup, Flyway migrations, and Phase 2 implementation, several real-world engineering hurdles were encountered and resolved:
@@ -787,6 +907,14 @@ During environment setup, Flyway migrations, and Phase 2 implementation, several
  7. Unmanaged Spring background poller       @SpringBootTest auto-started JobWorkerEngine
     stealing test jobs under concurrency.    which claimed test batches without test handlers.
                                              Disabled worker in application-test.yaml.
+
+ 8. OkHttp RouteSelector bypassing DNS hook  RouteSelector.kt short-circuits Dns.lookup for
+    for IP literals (127.0.0.1, [::1]).      IP literals. Added OkHttp Network Interceptor
+                                             validating actual connected socket at wire level.
+
+ 9. Spring Boot kebab-case mapping on        Configuration properties prefix mapping didn't
+    worker properties.                       bind nested ssrf.allow-private-ips; renamed
+                                             to ssrf-allow-private-ips in YAML.
 ```
 
 1. **Missing `javac` in Fedora Headless JRE**:
@@ -804,6 +932,14 @@ During environment setup, Flyway migrations, and Phase 2 implementation, several
    - *Symptom*: `testConcurrency1000Jobs5Workers` intermittently reported 990 succeeded out of 1,000 jobs.
    - *Cause*: `@SpringBootTest` started a background `JobWorkerEngine` poller thread using the default ApplicationContext `JobHandlerRegistry`. The poller claimed 1 batch (10 jobs) of `CONCURRENCY_TEST` jobs, but couldn't execute them because the test-specific handler was not in the application-wide registry, transitioning them to `DEAD`.
    - *Resolution*: Created `src/test/resources/application-test.yaml` with `scheduler.worker.enabled: false`, ensuring only test-harness-instantiated workers poll during integration tests.
+5. **OkHttp RouteSelector Bypassing `Dns.lookup` for IP-Literal Hosts**:
+   - *Symptom*: OkHttp's internal `RouteSelector.kt` directly calls `InetAddress.getByName` for IP strings without delegating to `okhttp3.Dns`.
+   - *Cause*: By design, OkHttp only calls `Dns.lookup` when `socketHost.canParseAsIpAddress()` is false.
+   - *Resolution*: Added an authoritative `SsrfNetworkInterceptor` via `client.addNetworkInterceptor(...)` which runs after TCP/TLS connect and validates `chain.connection().socket().getInetAddress()` before request bytes are written.
+6. **Spring Boot Kebab-Case Property Binding**:
+   - *Symptom*: `@ConfigurationProperties(prefix = "scheduler.worker")` failed to bind `scheduler.worker.ssrf.allow-private-ips: true` to field `boolean ssrfAllowPrivateIps`.
+   - *Cause*: Spring Boot maps `ssrfAllowPrivateIps` to kebab-case `ssrf-allow-private-ips`, not nested path `ssrf.allow-private-ips`.
+   - *Resolution*: Updated `application-test.yaml` and production configs to use `scheduler.worker.ssrf-allow-private-ips: true`.
 
 ---
 
@@ -951,6 +1087,35 @@ frontend/.astro/
 > By truncating `response_snippet` at 4,096 characters and appending metadata indicating the original response length, we ensure that:
 > 1. Developers receive enough information (JSON error messages, status headers, top of stack trace) to diagnose 99.9% of failures.
 > 2. Database disk usage and WAL generation remain strictly bounded and predictable regardless of how erratically downstream endpoints behave."
+
+### Q16: Why is user-space DNS pre-resolution insufficient to defend against DNS rebinding, and how does our OkHttp Dns hook guarantee that no connection occurs outside the validation hook?
+**Interview Defense**:
+> "A common but fatally flawed approach to SSRF protection is 'pre-flight validation': resolving a domain name in application code using `InetAddress.getAllByName(host)`, verifying that the returned IP is not private, and then passing the original URL to a standard HTTP client (like Java's default `java.net.http.HttpClient`).
+> This creates a Time-of-Check to Time-of-Use (TOCTOU) race condition known as a **DNS Rebinding Attack**. An attacker configures a DNS authoritative nameserver with a Time-To-Live (TTL) of 0 seconds. When our application resolves the hostname during the pre-flight check, the nameserver responds with a legitimate public IP address (e.g. `93.184.216.34`), passing validation. Milliseconds later, when the HTTP client creates the socket, it resolves the domain a second time because the TTL expired. On this second query, the attacker's nameserver responds with `127.0.0.1` or `169.254.169.254` (the AWS/GCP instance metadata service). The socket connects directly to the internal service, completely bypassing the pre-flight check.
+> We eliminated this vulnerability by replacing JDK HttpClient with Square OkHttp and enforcing the invariant: *Every lookup used for a connection is validated and no path resolves outside the hook.*
+> OkHttp exposes the `okhttp3.Dns` SPI. When OkHttp establishes a connection, it invokes our `SsrfAwareDns` hook. Our hook resolves the hostname, authoritatively verifies that every returned `InetAddress` is a routable Global Unicast address, and supplies the validated address list directly to OkHttp's connection pool. OkHttp connects **only** to the addresses returned by our hook, while preserving the original hostname for TLS SNI and HTTP `Host` headers. No secondary out-of-band resolution can ever occur."
+
+### Q17: Why did we need an OkHttp Network Interceptor in addition to `Dns.lookup()`, and what happens when an attacker passes a raw IP literal like `127.0.0.1` or `169.254.169.254`?
+**Interview Defense**:
+> "During our source-level audit of OkHttp's connection pipeline (`RouteSelector.kt`), we discovered that OkHttp bypasses `Dns.lookup()` whenever the destination host string can be parsed directly as an IP address (`if (socketHost.canParseAsIpAddress()) listOf(InetAddress.getByName(socketHost)) else address.dns.lookup(socketHost)`).
+> If a client schedules a job targeting a raw IP literal (e.g., `http://127.0.0.1/` or `http://169.254.169.254/`), the `Dns` hook is never invoked.
+> While our URL parser fast-fails standard dotted-decimal and bracketed IPv6 literals, relying exclusively on string parsing is brittle because attackers can obfuscate IP addresses using alternative notations (such as decimal `http://2130706433/`, octal `http://0177.0.0.1/`, hex `http://0x7f000001/`, or IPv4-mapped IPv6 `http://[::ffff:127.0.0.1]/`).
+> To guarantee airtight wire-level defense-in-depth, we added an `SsrfNetworkInterceptor` via `client.addNetworkInterceptor(...)`. OkHttp executes network interceptors after the physical TCP connection is established and the TLS handshake completes, but **before a single byte of HTTP request data is transmitted**.
+> The interceptor inspects the actual connected socket:
+> `InetAddress connectedAddress = chain.connection().socket().getInetAddress();`
+> It executes authoritative bitmask checks against our 14 IPv4 restricted CIDRs and IPv6 `2000::/3` boundaries. If any socket is connected to a loopback, link-local, private, or non-global unicast address, the interceptor immediately closes the connection and throws an `SsrfException`, guaranteeing zero bytes of request headers or payloads ever reach an unauthorized host."
+
+### Q18: What security risks occur during cross-origin HTTP redirects in an automated scheduler, and how do our header-stripping and downgrade-prevention rules mitigate them?
+**Interview Defense**:
+> "Automated HTTP clients that blindly follow redirects introduce two severe security vulnerabilities:
+> 1. **Credential & Sensitive Header Leakage**: When a client schedules an authenticated webhook to `https://api.example.com/webhook` with headers like `Authorization: Bearer secret-token` or `X-Api-Key: secret-key`, a malicious or compromised target could issue an HTTP 302 redirecting to `https://evil-attacker.com/collect`. If the HTTP client naively forwards the original headers, the third-party server captures the user's secret API credentials.
+> 2. **Transport Security Downgrade (SSL Stripping)**: A target answering on `https://` could redirect the client to `http://unencrypted-site.com/endpoint`, exposing request payloads, sensitive tokens, and signatures to interception over cleartext networks.
+> 
+> To mitigate these vulnerabilities, we implemented a secure manual redirect loop (capping at 5 hops):
+> - **Cross-Origin Header Stripping**: Before executing a redirect hop, we compare the target origin (scheme, host, port) against the current origin. If the origin differs, we strip **all user-supplied headers**, preserving only safe metadata (`Content-Type`, `Accept`, `User-Agent`).
+> - **Downgrade Blocking**: Any redirect attempting to transition from `https://` to `http://` is immediately aborted with a terminal error.
+> - **Cumulative Deadline Enforcement**: Rather than resetting timeout budgets per hop (which would allow a 5-hop redirect chain to stall worker execution for $5 \times 10\text{s} = 50\text{s}$), each hop calculates its timeout from the remaining balance of the overall job deadline ($\text{deadlineNanos} - \text{System.nanoTime()}$).
+> - **RFC 9110 Method Mutation**: Status codes 301, 302, and 303 mutate the request method to `GET` and drop the request body, whereas 307 and 308 preserve the original method and payload verbatim."
 
 
 

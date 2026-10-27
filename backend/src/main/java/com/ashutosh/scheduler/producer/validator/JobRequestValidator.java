@@ -2,6 +2,7 @@ package com.ashutosh.scheduler.producer.validator;
 
 import com.ashutosh.scheduler.common.exception.ValidationException;
 import com.ashutosh.scheduler.producer.dto.CreateJobRequest;
+import com.ashutosh.scheduler.worker.ssrf.SsrfValidator;
 import org.springframework.stereotype.Component;
 
 import java.net.URI;
@@ -28,6 +29,12 @@ public class JobRequestValidator {
     private static final Set<String> FORBIDDEN_HEADERS = Set.of(
         "host", "content-length", "transfer-encoding", "connection"
     );
+
+    private final SsrfValidator ssrfValidator;
+
+    public JobRequestValidator(SsrfValidator ssrfValidator) {
+        this.ssrfValidator = ssrfValidator;
+    }
 
     public void validate(CreateJobRequest request, String headerIdempotencyKey) {
         if (request == null) {
@@ -84,20 +91,11 @@ public class JobRequestValidator {
             throw new ValidationException("URL length exceeds maximum allowed limit of " + MAX_URL_LENGTH + " characters.");
         }
 
-        // NOTE: URL validation verifies syntax and URI structure only.
-        // It does NOT constitute SSRF protection. SSRF protection is strictly
-        // enforced at execution time via DNS pre-resolution and IP filtering in Phase 6.
+        // Fast-fail syntax, scheme, userinfo, fragment, backslash, port, and non-standard IP checks
         try {
-            URI uri = URI.create(url.trim());
-            String scheme = uri.getScheme();
-            if (scheme == null || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))) {
-                throw new ValidationException("URL must use http or https scheme.");
-            }
-            if (uri.getHost() == null || uri.getHost().isBlank()) {
-                throw new ValidationException("URL must contain a valid host.");
-            }
-        } catch (IllegalArgumentException e) {
-            throw new ValidationException("Invalid URL syntax: " + e.getMessage());
+            ssrfValidator.validateUrl(url);
+        } catch (com.ashutosh.scheduler.worker.ssrf.SsrfException e) {
+            throw new ValidationException("Invalid URL: " + e.getMessage());
         }
     }
 
