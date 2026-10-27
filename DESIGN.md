@@ -273,3 +273,66 @@ Execution Time: 0.031 ms
   - Development / Local: Automatically bootstrapped via `DevBootstrapRunner` (`@Profile("!test")`), which generates an initial key and prints it once to stdout.
   - Production: Provisioned via administrative CLI tools or migration scripts.
 
+---
+
+## 10. Recurring Cron Schedules Architecture (Phase 8)
+
+### 10.1 Daylight Saving Time (DST) Transitions
+Recurring cron schedules run against arbitrary IANA timezones (e.g., `America/New_York`, `Europe/London`, `Asia/Kolkata`). Because wall clocks shift during Daylight Saving Time, the scheduler adheres to strict transition invariants:
+
+1. **Spring-Forward (Gap Jump)**:
+   - *Example*: In `America/New_York` on Sunday, March 8, 2026, clocks spring forward from `01:59:59 EST` directly to `03:00:00 EDT`. The hour `02:00:00` to `02:59:59` does not exist on the local clock.
+   - *Behavior*: A daily schedule configured for `0 30 2 * * *` (02:30 AM) cannot execute on March 8 because that local time does not exist. Spring's `CronExpression` evaluates the local timeline, detects the non-existent hour, and advances to the next valid calendar day: Monday, March 9, 2026 at `02:30:00 EDT`. Schedules targeting valid times on the transition day (e.g., 03:30 AM) execute normally.
+2. **Fall-Back (Single Execution Invariant)**:
+   - *Example*: In `America/New_York` on Sunday, November 1, 2026, clocks fall back from `02:00:00 EDT` (-04:00) to `01:00:00 EST` (-05:00). The local hour `01:00:00` to `01:59:59` occurs twice in real time (separated by 1 physical hour).
+   - *Behavior*: A daily schedule targeting `0 30 1 * * *` (01:30 AM) **must fire strictly ONCE** on that calendar day.
+   - *DST Fall-Back Guard*:
+     - When the first occurrence at `01:30:00 EDT` (05:30:00 UTC) fires, `CronScheduleProcessor.advanceNextRunAt` inspects `cron.next(nowZdt)`.
+     - Spring `CronExpression` calculates the next chronological match, which would mathematically be the second `01:30:00 EST` occurrence (06:30:00 UTC).
+     - The guard compares `nextZdt.toLocalDateTime()` against `targetTickZdt.toLocalDateTime()`. Because they are identical (`2026-11-01T01:30:00`), it detects the repeated fall-back hour and automatically advances past it: `nextZdt = cron.next(nextZdt)`.
+     - This sets `schedule.next_run_at` directly to `2026-11-02T01:30:00-05:00` (Nov 2).
+     - One hour later at `01:30:00 EST` (06:30:00 UTC), the schedule is not due (`next_run_at` is Nov 2), completely preventing duplicate execution.
+
+### 10.2 Transaction Structure & Connection Pool Safety
+To guarantee high throughput and zero connection pool exhaustion under small connection pools (e.g., HikariCP `maximum-pool-size=3` with 6+ concurrent sweeper threads):
+
+1. **Non-Transactional Sweeper Polling**:
+   - `CronSchedulerEngine.pollOnce()` is intentionally **not** annotated with `@Transactional`.
+   - `scheduleRepository.claimDueSchedules(BATCH_SIZE)` executes `SELECT ... FOR UPDATE SKIP LOCKED` inside its own isolated transaction and immediately commits.
+   - **Crucial Invariant**: The claim row lock is **released immediately** upon returning candidate IDs to the engine. No database connection is held by `pollOnce()` while iterating over the batch.
+2. **Connection Pool Deadlock Elimination**:
+   - If `pollOnce()` held an open transaction (Connection 1) and then called `processSchedule` annotated with `@Transactional(propagation = Propagation.REQUIRES_NEW)`, Spring would suspend Connection 1 and checkout Connection 2 from HikariCP.
+   - Under concurrent sweepers and small connection pools, multiple threads holding Connection 1 would exhaust the pool waiting for Connection 2, causing total HikariCP deadlock.
+   - By releasing the claim connection immediately, every sweeper thread checks out at most **one** connection at a time.
+3. **Lock Re-Check Guard in `processSchedule`**:
+   - Because the initial claim lock was released, `processSchedule(scheduleId, now)` checks out a connection in its `REQUIRES_NEW` transaction and executes:
+     ```sql
+     SELECT * FROM schedules WHERE id = :scheduleId FOR UPDATE;
+     ```
+   - Immediately after acquiring the lock, it re-evaluates:
+     ```java
+     if (schedule == null || !schedule.isEnabled() || schedule.getNextRunAt().isAfter(now)) {
+         return;
+     }
+     ```
+   - If another sweeper thread already processed the schedule and advanced `next_run_at` into the future, the current thread detects `next_run_at > now` and safely bails out without duplicating the job.
+
+### 10.3 Grace Window & Misfire Policy
+- **Lateness Measurement**: Lateness is calculated as `now - most recent missed tick` (using `findLatestMissedTick`), rather than total downtime since the oldest missed tick.
+- **`SKIP` Policy**: If the scheduler was down for multiple ticks or lateness exceeds `grace_window_seconds`, the schedule skips missed executions, records `last_skip_reason = MISFIRE_SKIP`, and advances `next_run_at` to the first tick strictly after `now`.
+- **`FIRE_ONCE` Policy**: If lateness <= `grace_window_seconds`, the scheduler fires exactly **one** catch-up job for the most recent missed tick with deterministic idempotency key `cron:<scheduleId>:<targetTickEpochSecond>`, and advances `next_run_at` strictly into the future. If lateness > `grace_window_seconds`, it skips execution.
+
+### 10.4 Tenant Schedule Cap & Error Contract Alignment
+- **Tenant Serialization**: In `ScheduleService.createSchedule`, the tenant row is locked via `SELECT * FROM users WHERE id = :userId FOR UPDATE`.
+- **Atomic Cap Enforcement**: The active schedule count is evaluated under the lock (`countByUserId(userId)`). If `count >= maxSchedules` (default: 20), it throws `MaxSchedulesExceededException`.
+- **Unified Quota Error Family**:
+  - HTTP Status: `429 Too Many Requests`.
+  - JSON Code: `"quota_exceeded"` (aligned with job active quota).
+  - Body: Includes `maxSchedules` and `currentSchedules`.
+  - Headers: Strictly **no** `Retry-After` or `X-RateLimit-*` headers (which are emitted exclusively for token bucket rate limits).
+
+### 10.5 Circuit Breaker & Error Sanitization
+- **Permanent Error Isolation**: Permanent validation errors (e.g., malformed template JSON, unsupported HTTP method) auto-disable the schedule immediately (`enabled = false`, `disabled_reason = "PERMANENT_VALIDATION_ERROR"`).
+- **Transient Error Threshold**: Transient errors (e.g., database connection timeouts) increment `consecutive_failures`. Upon reaching `maxConsecutiveFailures` (5), the schedule auto-disables (`disabled_reason = "MAX_CONSECUTIVE_FAILURES_EXCEEDED"`).
+- **Security Sanitization**: Raw database exceptions (Postgres SQL syntax, connection strings) and Java stack traces are stripped before storage in `last_error`. Only safe, sanitized messages (e.g. `"Database error during schedule execution"`) are persisted and exposed via the API.
+

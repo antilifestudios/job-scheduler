@@ -1213,22 +1213,16 @@ CREATE INDEX idx_jobs_schedule_active ON jobs (schedule_id)
     WHERE status IN ('PENDING', 'RUNNING');
 ```
 
-#### Measured Execution Plan (1,000 Historical Jobs)
+#### Query Planner Execution Strategy
+The query planner uses the partial index `idx_jobs_schedule_active` (`Index Only Scan` on `jobs` where `status IN ('PENDING', 'RUNNING')`):
 ```text
-Aggregate  (cost=8.16..8.17 rows=1 width=8) (actual time=0.038..0.038 rows=1.00 loops=1)
-  Buffers: shared hit=2
-  ->  Index Only Scan using idx_jobs_schedule_active on jobs  (cost=0.14..8.16 rows=1 width=0) (actual time=0.033..0.035 rows=5.00 loops=1)
-        Index Cond: (schedule_id = '01a17d4e-c480-7e89-997d-8adee1cbdd58'::uuid)
-        Heap Fetches: 5
-        Index Searches: 1
-        Buffers: shared hit=2
-Planning Time: 0.121 ms
-Execution Time: 0.050 ms
+Aggregate  (cost=8.16..8.17 rows=1 width=8)
+  ->  Index Only Scan using idx_jobs_schedule_active on jobs  (cost=0.14..8.16 rows=1 width=0)
+        Index Cond: (schedule_id = :scheduleId)
 ```
 
-- **Execution Time**: **0.050 ms** (~50 microseconds).
-- **Buffer Hits**: **shared hit=2** (PostgreSQL accesses exactly 2 8-KB memory buffer pages in the partial index; zero heap table scan).
-- **Write Efficiency**: Because the index predicate is `WHERE status IN ('PENDING', 'RUNNING')`, completed (`SUCCEEDED`) or dead-lettered (`DEAD`) jobs are instantly pruned from the index leaf pages, maintaining a microsecond-fast, compact index tree in RAM.
+- **Query Planner Strategy**: PostgreSQL exclusively navigates the compact partial index `idx_jobs_schedule_active`, performing an `Index Only Scan` that never scans the heap table or touches inactive historical rows.
+- **Write Efficiency**: Because the partial index predicate is `WHERE status IN ('PENDING', 'RUNNING')`, completed (`SUCCEEDED`) or dead-lettered (`DEAD`) jobs are automatically pruned from the index leaf pages, maintaining a compact B-Tree in RAM regardless of historical row volume.
 
 ---
 
@@ -1587,11 +1581,35 @@ frontend/.astro/
 > "Suppose a cron scheduler runs a job every 5 minutes (`0 */5 * * * *`). The scheduler suffers a 3-hour infrastructure outage (36 missed ticks). A naive scheduler that attempts to execute all 36 missed ticks upon restart will instantly flood both the local database and downstream webhook endpoints with a massive 36x thundering herd, overwhelming downstream rate limiters and knocking target APIs offline.
 > We mitigate this through explicit misfire policies anchored to PostgreSQL time:
 > - **`SKIP`**: Immediately discards all missed intervals, advances `next_run_at` to the first cron tick strictly after `now()`, and records `last_skip_reason = 'MISFIRE_SKIP'`.
-> - **`FIRE_ONCE` with Grace Window**: Checks if the elapsed downtime is within `grace_window_seconds`. If within grace, it executes exactly ONE catch-up job representing the most recent missed tick (using that tick's deterministic idempotency key `cron:{id}:{missedTickEpoch}`), and resets `next_run_at` to the first cron tick strictly after `now()`. If downtime exceeds the grace window, it treats the misfire as expired and skips entirely. In neither mode does it ever blast a queue with a backlog of dozens of missed runs.
+> - **`FIRE_ONCE` with Grace Window**: Lateness is measured as `now - most recent missed tick` (using `findLatestMissedTick`), NOT total downtime from the oldest missed tick. If lateness $\le$ `grace_window_seconds`, it executes exactly ONE catch-up job representing the most recent missed tick (using that tick's deterministic idempotency key `cron:{id}:{missedTickEpoch}`), and advances `next_run_at` to the first cron tick strictly after `now()`. If lateness exceeds the grace window, it treats the misfire as expired and skips entirely. In neither mode does it ever blast a queue with a backlog of dozens of missed runs.
 > 
 > **Daylight Saving Time (DST) Transitions with IANA Timezones**:
-> - **Spring-Forward (Gap)**: In `America/New_York` on the second Sunday of March, 01:59:59 jumps to 03:00:00 EDT. If a cron is configured for 02:30 (`0 30 2 * * *`), that local wall-clock hour does not exist. Spring's `CronExpression.next()` detects the non-existent time in the ZoneRules and advances to the next valid match on March 9. Crons targeting valid hours (e.g. 03:30) fire normally on March 8 at 03:30 EDT.
-> - **Fall-Back (Overlap)**: On the first Sunday of November, 01:59:59 EDT turns back to 01:00:00 EST. Hour 01:xx repeats. `CronExpression.next()` matches the first occurrence at 01:30 EDT (-04:00), then on subsequent evaluation matches the second occurrence at 01:30 EST (-05:00), ensuring both real-world hours fire without skipping or timezone corruption."
+> - **Spring-Forward (Gap Jump)**: In `America/New_York` on the second Sunday of March (e.g. March 8, 2026), 01:59:59 jumps directly to 03:00:00 EDT. If a cron is configured for 02:30 (`0 30 2 * * *`), that local wall-clock hour does not exist on that calendar day. Spring's `CronExpression.next()` detects the non-existent time in the ZoneRules and advances to the next valid match on March 9 at 02:30 EDT. Crons targeting valid hours (e.g. 03:30) fire normally on March 8 at 03:30 EDT.
+> - **Fall-Back (Single Execution Invariant)**: On the first Sunday of November (e.g. November 1, 2026), 01:59:59 EDT turns back to 01:00:00 EST. The local hour 01:xx occurs twice in real time (first at EDT/UTC-4, then 1 hour later at EST/UTC-5). The invariant is that the repeated hour must fire **strictly ONCE** on that calendar day. When the first occurrence at 01:30 EDT (05:30 UTC) fires, the scheduler's DST fall-back guard inspects `cron.next(nowZdt)`. Finding that the next chronological match has the identical local date-time (`2026-11-01T01:30:00`), it automatically advances past the duplicate occurrence to the next calendar day: `2026-11-02T01:30:00-05:00`. When the second 01:30 occurrence arrives 1 hour later (at 06:30 UTC), `next_run_at` is already Nov 2, so the repeated hour never fires twice."
+
+### Q25: Why is `claimDueSchedules` non-transactional in `CronSchedulerEngine`, and how does this prevent HikariCP connection pool deadlocks under concurrent sweepers?
+**Interview Defense**:
+> "If the sweeper loop `pollOnce()` held an enclosing transaction, it would hold an active database connection ($C_1$) from the HikariCP pool while calling `claimDueSchedules(FOR UPDATE SKIP LOCKED)`.
+> Then, for each schedule in the batch, `CronScheduleProcessor.processSchedule()` is annotated with `@Transactional(propagation = Propagation.REQUIRES_NEW)`.
+> In Spring and JDBC, `REQUIRES_NEW` suspends the outer transaction and requests a **second** independent database connection ($C_2$) from HikariCP on the same thread.
+> If multiple sweeper threads run concurrently under a small connection pool (e.g. pool size = 3, sweeper threads = 6):
+> 1. All 3 connections would be checked out as $C_1$ by the first 3 threads.
+> 2. Each of those threads would then block waiting for $C_2$ to become available.
+> 3. Because no thread can proceed without $C_2$, and no $C_1$ will ever be returned, HikariCP enters **total connection pool deadlock**, eventually timing out with `ConnectionTimeoutException`.
+> 4. Furthermore, if $C_1$ held row locks from `claimDueSchedules`, $C_2$ attempting `SELECT ... FOR UPDATE` on the same row from the same JVM process would cause a PostgreSQL self-deadlock!
+> 
+> To eliminate this, `pollOnce()` is intentionally **non-transactional**. `claimDueSchedules()` executes in its own auto-commit transaction, selects candidate rows with `FOR UPDATE SKIP LOCKED`, and **immediately releases the connection and lock**.
+> When `processSchedule(REQUIRES_NEW)` executes, it checks out exactly ONE connection, acquires the definitive pessimistic row lock (`findByIdForUpdate`), and **re-checks `if (schedule.getNextRunAt().isAfter(now)) return;`**. If another sweeper already processed the schedule and advanced `next_run_at`, the thread safely yields. Every sweeper thread holds at most 1 connection at any instant, completely preventing pool exhaustion."
+
+### Q26: How is tenant schedule quota enforced, and why must its error contract align with job active quotas rather than rate limits?
+**Interview Defense**:
+> "To prevent abusive tenants from registering thousands of recurring schedules, `ScheduleService.createSchedule` caps schedules per tenant (default: 20).
+> 1. **Tenant Serialization**: To eliminate concurrent creation race conditions where 10 parallel requests with 1 slot free all see count=19 and create 10 schedules, the creation transaction begins by locking the tenant user row: `SELECT * FROM users WHERE id = :userId FOR UPDATE`.
+> 2. **Evaluation Under Lock**: Under this exclusive lock, `scheduleRepository.countByUserId(userId)` evaluates the current active count. If $\ge 20$, it rolls back and throws `MaxSchedulesExceededException`.
+> 3. **Error Contract Alignment**:
+>    - Job active quota and schedule cap belong to the **same quota family**. Both return HTTP 429 `TOO_MANY_REQUESTS` with machine-readable `code: "quota_exceeded"`.
+>    - Crucially, neither returns `Retry-After` or `X-RateLimit-*` headers! Those HTTP headers are reserved strictly for token bucket rate limiters (which refill over time on a known cadence). Quota exhaustion cannot be resolved by simply waiting for a timer—it requires the tenant to explicitly delete existing resources or upgrade their quota plan."
+
 
 
 

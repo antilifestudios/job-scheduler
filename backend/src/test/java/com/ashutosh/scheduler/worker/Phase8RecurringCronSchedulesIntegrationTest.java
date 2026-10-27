@@ -429,6 +429,96 @@ class Phase8RecurringCronSchedulesIntegrationTest {
     }
 
     @Test
+    @DisplayName("Grace window positive FIRE_ONCE test: 3 hours down, every-minute cron, within grace fires exactly 1 job, next_run_at in future, correct idempotency key")
+    void testFireOnceThreeHourDowntimeEveryMinuteCronWithinGrace() {
+        ScheduleResponse schedule = scheduleService.createSchedule(tenantId, new CreateScheduleRequest(
+            "0 * * * * *", "UTC", OverlapPolicy.ALLOW, MisfirePolicy.FIRE_ONCE, 300, defaultTemplate()
+        ));
+
+        // Scheduler went down 3 hours ago: last scheduled due time was 12:00:00 UTC
+        Instant dueBase = Instant.parse("2026-10-27T12:00:00Z");
+        jdbcTemplate.update("UPDATE schedules SET next_run_at = ? WHERE id = ?",
+            Timestamp.from(dueBase), schedule.id());
+
+        // Scheduler recovers at 15:00:20 UTC (3 hours and 20 seconds later)
+        // Lateness of the candidate tick being fired (15:00:00) is now - most recent missed tick = 20 seconds.
+        // 20s <= 300s grace window -> within grace!
+        Instant recoveryTime = Instant.parse("2026-10-27T15:00:20Z");
+        Instant expectedTargetTick = Instant.parse("2026-10-27T15:00:00Z");
+        String expectedIdempotencyKey = "cron:" + schedule.id() + ":" + expectedTargetTick.getEpochSecond();
+
+        scheduleProcessor.processSchedule(schedule.id(), recoveryTime);
+
+        // Assert 1: Exactly 1 job created
+        List<JobEntity> spawnedJobs = jobRepository.findByScheduleIdOrderByCreatedAtDesc(
+            schedule.id(), org.springframework.data.domain.Pageable.unpaged()
+        ).getContent();
+        assertThat(spawnedJobs).hasSize(1);
+
+        // Assert 2: Job properties and correct idempotency key
+        JobEntity spawnedJob = spawnedJobs.get(0);
+        assertThat(spawnedJob.getIdempotencyKey()).isEqualTo(expectedIdempotencyKey);
+        assertThat(spawnedJob.getRunAt()).isEqualTo(expectedTargetTick);
+        assertThat(spawnedJob.getStatus()).isEqualTo(JobStatus.PENDING);
+
+        // Assert 3: Schedule state advanced strictly into the future
+        ScheduleEntity updatedSchedule = scheduleRepository.findById(schedule.id()).orElseThrow();
+        assertThat(updatedSchedule.getLastFiredAt()).isEqualTo(recoveryTime);
+        assertThat(updatedSchedule.getLastSkipReason()).isNull();
+        Instant expectedNextRunAt = Instant.parse("2026-10-27T15:01:00Z");
+        assertThat(updatedSchedule.getNextRunAt()).isEqualTo(expectedNextRunAt);
+        assertThat(updatedSchedule.getNextRunAt()).isAfter(recoveryTime);
+
+        // Assert 4: Immediate second sweep at recoveryTime + 10s does not fire duplicate job
+        scheduleProcessor.processSchedule(schedule.id(), recoveryTime.plusSeconds(10));
+        long jobsAfterSecondSweep = jobRepository.findByScheduleIdOrderByCreatedAtDesc(
+            schedule.id(), org.springframework.data.domain.Pageable.unpaged()
+        ).getTotalElements();
+        assertThat(jobsAfterSecondSweep).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("DST Fall-Back End-to-End: repeated 01:30 local hour fires strictly once on transition day")
+    void testDstFallBackRepeatedHourFiresStrictlyOnceEndToEnd() {
+        // Daily schedule at 01:30 AM America/New_York
+        ScheduleResponse schedule = scheduleService.createSchedule(tenantId, new CreateScheduleRequest(
+            "0 30 1 * * *", "America/New_York", OverlapPolicy.ALLOW, MisfirePolicy.FIRE_ONCE, 300, defaultTemplate()
+        ));
+
+        // 1. First occurrence of 01:30 on Nov 1, 2026 is at 01:30:00 EDT (05:30:00 UTC)
+        Instant firstOccurrenceUtc = Instant.parse("2026-11-01T05:30:00Z");
+        jdbcTemplate.update("UPDATE schedules SET next_run_at = ? WHERE id = ?",
+            Timestamp.from(firstOccurrenceUtc), schedule.id());
+
+        // Process schedule at first occurrence
+        scheduleProcessor.processSchedule(schedule.id(), firstOccurrenceUtc.plusSeconds(15));
+
+        // Assert: Exactly 1 job fired for first occurrence
+        List<JobEntity> jobsAfterFirst = jobRepository.findByScheduleIdOrderByCreatedAtDesc(
+            schedule.id(), org.springframework.data.domain.Pageable.unpaged()
+        ).getContent();
+        assertThat(jobsAfterFirst).hasSize(1);
+        assertThat(jobsAfterFirst.get(0).getRunAt()).isEqualTo(firstOccurrenceUtc);
+
+        // Assert: Schedule's next_run_at was advanced PAST the duplicate 01:30 EST hour to Nov 2 at 01:30 EST (06:30 UTC Nov 2)
+        ScheduleEntity entityAfterFirst = scheduleRepository.findById(schedule.id()).orElseThrow();
+        Instant expectedNextDayRunAt = Instant.parse("2026-11-02T06:30:00Z");
+        assertThat(entityAfterFirst.getNextRunAt()).isEqualTo(expectedNextDayRunAt);
+
+        // 2. Second occurrence of 01:30 occurs 1 hour later at 01:30:00 EST (06:30:00 UTC)
+        Instant secondOccurrenceUtc = Instant.parse("2026-11-01T06:30:00Z");
+
+        // Sweeper attempts to process schedule at second occurrence
+        scheduleProcessor.processSchedule(schedule.id(), secondOccurrenceUtc.plusSeconds(15));
+
+        // Assert: Next run is still Nov 2, so the repeated hour is skipped and NO second job is created!
+        List<JobEntity> jobsAfterSecond = jobRepository.findByScheduleIdOrderByCreatedAtDesc(
+            schedule.id(), org.springframework.data.domain.Pageable.unpaged()
+        ).getContent();
+        assertThat(jobsAfterSecond).hasSize(1); // STILL EXACTLY 1!
+    }
+
+    @Test
     @DisplayName("Resume-after-pause: recomputes next_run_at strictly from now without firing old backlog ticks")
     void testResumeAfterPauseRecomputesNextRunFromNow() {
         ScheduleResponse schedule = scheduleService.createSchedule(tenantId, new CreateScheduleRequest(
