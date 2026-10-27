@@ -8,15 +8,12 @@ import com.ashutosh.scheduler.producer.dto.HttpPayloadDto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
-import tools.jackson.core.JsonProcessingException;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
-import java.net.ConnectException;
 import java.net.SocketException;
 import java.net.URI;
 import java.net.http.HttpClient;
-import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
@@ -64,7 +61,7 @@ public class HttpJobHandler implements JobHandler {
         HttpPayloadDto payload;
         try {
             payload = objectMapper.readValue(job.getPayload(), HttpPayloadDto.class);
-        } catch (JsonProcessingException e) {
+        } catch (Exception e) {
             String errorMsg = "Malformed JSON payload: " + e.getMessage();
             recordAttempt(job, startedAt, System.currentTimeMillis() - startTime, null, null, errorMsg);
             return JobExecutionResult.permanentFailure(errorMsg);
@@ -95,14 +92,14 @@ public class HttpJobHandler implements JobHandler {
 
             return classifyResponse(statusCode, snippet, durationMs);
 
-        } catch (HttpTimeoutException | HttpConnectTimeoutException e) {
+        } catch (HttpTimeoutException e) {
             long durationMs = System.currentTimeMillis() - startTime;
             String errorMsg = "HTTP request timeout: " + e.getMessage();
             log.warn("Job {} timed out after {}ms: {}", job.getId(), durationMs, errorMsg);
             recordAttempt(job, startedAt, durationMs, null, null, errorMsg);
             return JobExecutionResult.retryableFailure(errorMsg);
 
-        } catch (ConnectException | SocketException e) {
+        } catch (SocketException e) {
             long durationMs = System.currentTimeMillis() - startTime;
             String errorMsg = "Network connection failure: " + e.getMessage();
             log.warn("Job {} connection error: {}", job.getId(), errorMsg);
