@@ -18,6 +18,9 @@ public class JobAttemptEntity {
     @Column(name = "job_id", nullable = false)
     private UUID jobId;
 
+    @Column(name = "replay_count", nullable = false)
+    private int replayCount = 0;
+
     @Column(name = "attempt_no", nullable = false)
     private int attemptNo;
 
@@ -43,8 +46,14 @@ public class JobAttemptEntity {
 
     public JobAttemptEntity(UUID id, UUID jobId, int attemptNo, Instant startedAt,
                             long durationMs, Integer statusCode, String responseSnippet, String error) {
+        this(id, jobId, 0, attemptNo, startedAt, durationMs, statusCode, responseSnippet, error);
+    }
+
+    public JobAttemptEntity(UUID id, UUID jobId, int replayCount, int attemptNo, Instant startedAt,
+                            long durationMs, Integer statusCode, String responseSnippet, String error) {
         this.id = id;
         this.jobId = jobId;
+        this.replayCount = replayCount;
         this.attemptNo = attemptNo;
         this.startedAt = startedAt;
         this.durationMs = durationMs;
@@ -59,6 +68,9 @@ public class JobAttemptEntity {
 
     public UUID getJobId() { return jobId; }
     public void setJobId(UUID jobId) { this.jobId = jobId; }
+
+    public int getReplayCount() { return replayCount; }
+    public void setReplayCount(int replayCount) { this.replayCount = replayCount; }
 
     public int getAttemptNo() { return attemptNo; }
     public void setAttemptNo(int attemptNo) { this.attemptNo = attemptNo; }

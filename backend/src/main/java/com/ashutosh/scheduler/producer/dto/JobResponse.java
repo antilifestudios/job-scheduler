@@ -22,6 +22,8 @@ public record JobResponse(
     String idempotencyKey,
     HttpPayloadDto payload,
     String body,
+    int replayCount,
+    Instant replayedAt,
     Instant createdAt,
     Instant updatedAt
 ) {
@@ -50,6 +52,8 @@ public record JobResponse(
             entity.getIdempotencyKey(),
             payloadDto,
             entity.getBody(),
+            entity.getReplayCount(),
+            entity.getReplayedAt(),
             entity.getCreatedAt(),
             entity.getUpdatedAt()
         );

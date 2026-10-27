@@ -75,6 +75,12 @@ public class JobEntity {
     @Column(name = "schedule_id")
     private UUID scheduleId;
 
+    @Column(name = "replay_count", nullable = false)
+    private int replayCount = 0;
+
+    @Column(name = "replayed_at")
+    private Instant replayedAt;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 
@@ -139,4 +145,10 @@ public class JobEntity {
 
     public Instant getUpdatedAt() { return updatedAt; }
     public void setUpdatedAt(Instant updatedAt) { this.updatedAt = updatedAt; }
+
+    public int getReplayCount() { return replayCount; }
+    public void setReplayCount(int replayCount) { this.replayCount = replayCount; }
+
+    public Instant getReplayedAt() { return replayedAt; }
+    public void setReplayedAt(Instant replayedAt) { this.replayedAt = replayedAt; }
 }

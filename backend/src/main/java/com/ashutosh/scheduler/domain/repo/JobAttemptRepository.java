@@ -10,4 +10,5 @@ import java.util.UUID;
 @Repository
 public interface JobAttemptRepository extends JpaRepository<JobAttemptEntity, UUID> {
     List<JobAttemptEntity> findByJobIdOrderByAttemptNoAsc(UUID jobId);
+    List<JobAttemptEntity> findByJobIdOrderByReplayCountAscAttemptNoAsc(UUID jobId);
 }

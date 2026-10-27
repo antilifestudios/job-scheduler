@@ -404,6 +404,7 @@ public class HttpJobHandler implements JobHandler {
             JobAttemptEntity attempt = new JobAttemptEntity(
                 UuidV7.generate(),
                 job.getId(),
+                job.getReplayCount(),
                 job.getAttempts(),
                 startedAt,
                 durationMs,
