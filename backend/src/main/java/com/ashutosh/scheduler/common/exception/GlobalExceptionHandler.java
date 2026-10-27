@@ -100,6 +100,28 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
     }
 
+    @ExceptionHandler(JobOverlapException.class)
+    public ResponseEntity<Map<String, Object>> handleJobOverlap(JobOverlapException ex) {
+        Map<String, Object> body = Map.of(
+            "timestamp", Instant.now().toString(),
+            "status", HttpStatus.CONFLICT.value(),
+            "code", "schedule_overlap",
+            "message", ex.getMessage()
+        );
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
+
+    @ExceptionHandler(MaxSchedulesExceededException.class)
+    public ResponseEntity<Map<String, Object>> handleMaxSchedulesExceeded(MaxSchedulesExceededException ex) {
+        Map<String, Object> body = Map.of(
+            "timestamp", Instant.now().toString(),
+            "status", HttpStatus.BAD_REQUEST.value(),
+            "code", "max_schedules_exceeded",
+            "message", ex.getMessage()
+        );
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> handleGeneric(Exception ex) {
         log.error("Unhandled internal server error: {}", ex.getMessage(), ex);

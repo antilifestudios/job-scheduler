@@ -72,6 +72,9 @@ public class JobEntity {
     @Column(name = "request_hash", length = 64)
     private String requestHash;
 
+    @Column(name = "schedule_id")
+    private UUID scheduleId;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 
@@ -82,6 +85,9 @@ public class JobEntity {
 
     public UUID getId() { return id; }
     public void setId(UUID id) { this.id = id; }
+
+    public UUID getScheduleId() { return scheduleId; }
+    public void setScheduleId(UUID scheduleId) { this.scheduleId = scheduleId; }
 
     public UUID getUserId() { return userId; }
     public void setUserId(UUID userId) { this.userId = userId; }

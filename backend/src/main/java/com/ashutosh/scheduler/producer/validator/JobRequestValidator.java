@@ -76,6 +76,12 @@ public class JobRequestValidator {
     }
 
     private void validateIdempotencyKeys(String bodyKey, String headerKey) {
+        if (bodyKey != null && bodyKey.startsWith("cron:")) {
+            throw new ValidationException("The 'cron:' idempotency key prefix is reserved for recurring schedule executions.");
+        }
+        if (headerKey != null && headerKey.startsWith("cron:")) {
+            throw new ValidationException("The 'cron:' idempotency key prefix is reserved for recurring schedule executions.");
+        }
         if (bodyKey != null && !bodyKey.isBlank() && headerKey != null && !headerKey.isBlank()) {
             if (!bodyKey.trim().equals(headerKey.trim())) {
                 throw new ValidationException("Header 'Idempotency-Key' and JSON field 'idempotencyKey' must match if both are provided.");

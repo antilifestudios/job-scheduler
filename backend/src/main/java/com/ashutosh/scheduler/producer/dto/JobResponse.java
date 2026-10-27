@@ -10,6 +10,7 @@ import java.util.UUID;
 
 public record JobResponse(
     UUID id,
+    UUID scheduleId,
     String queue,
     String type,
     JobStatus status,
@@ -37,6 +38,7 @@ public record JobResponse(
 
         return new JobResponse(
             entity.getId(),
+            entity.getScheduleId(),
             entity.getQueue(),
             entity.getType(),
             entity.getStatus(),

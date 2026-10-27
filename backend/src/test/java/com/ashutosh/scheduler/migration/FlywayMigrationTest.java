@@ -51,7 +51,9 @@ class FlywayMigrationTest {
             "idx_job_attempts_job_id",
             "idx_schedules_next_run",
             "idx_api_keys_lookup",
-            "idx_api_keys_user"
+            "idx_api_keys_user",
+            "idx_jobs_schedule_active",
+            "idx_jobs_schedule_id"
         );
     }
 

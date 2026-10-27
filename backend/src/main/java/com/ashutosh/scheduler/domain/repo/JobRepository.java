@@ -32,4 +32,12 @@ public interface JobRepository extends JpaRepository<JobEntity, UUID> {
     }
 
     long countByUserIdAndStatus(UUID userId, JobStatus status);
+
+    long countByScheduleIdAndStatusIn(UUID scheduleId, java.util.Collection<JobStatus> statuses);
+
+    default boolean hasActiveJobsForSchedule(UUID scheduleId) {
+        return countByScheduleIdAndStatusIn(scheduleId, java.util.List.of(JobStatus.PENDING, JobStatus.RUNNING)) > 0;
+    }
+
+    Page<JobEntity> findByScheduleIdOrderByCreatedAtDesc(UUID scheduleId, Pageable pageable);
 }

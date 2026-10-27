@@ -1,6 +1,6 @@
 # Reliable HTTP Job Scheduler — Architecture & Technical Design Document
 
-> **Document Version:** 1.5.0 (Phase 6 SSRF Hardening, DNS Pinning & Wire Validation)  
+> **Document Version:** 1.6.0 (Phase 7 Multi-Tenancy, Quotas & Rate Limiting)  
 > **Status:** Active / Under Iterative Development  
 > **Target Audience:** Engineering Mentors, Backend System Designers, Technical Interviewers  
 
@@ -46,6 +46,10 @@
    - [4.28 OkHttp Network Interceptor Wire Guard for IP-Literal Hosts](#428-okhttp-network-interceptor-wire-guard-for-ip-literal-hosts)
    - [4.29 Authoritative Default-Deny IP Range Engine & IPv6 2000::/3 Space](#429-authoritative-default-deny-ip-range-engine--ipv6-20003-space)
    - [4.30 Secure Manual Redirect Loop, Cross-Origin Header Stripping & Port Allowlist](#430-secure-manual-redirect-loop-cross-origin-header-stripping--port-allowlist)
+   - [4.31 Multi-Tenant Concurrency Quotas (`max_active_jobs`) & Pessimistic Locking](#431-multi-tenant-concurrency-quotas-max_active_jobs--pessimistic-locking)
+   - [4.32 In-Memory CAS Token Bucket Rate Limiting & Per-Instance Scope](#432-in-memory-cas-token-bucket-rate-limiting--per-instance-scope)
+   - [4.33 Machine-Readable Error Contract (`rate_limited` vs `quota_exceeded`) & Dashboard Usage Endpoint](#433-machine-readable-error-contract-rate_limited-vs-quota_exceeded--dashboard-usage-endpoint)
+   - [4.34 Dedicated API Key Lifecycle, Scope Limitations & Throttled Usage Tracking](#434-dedicated-api-key-lifecycle-scope-limitations--throttled-usage-tracking)
 5. [What Went Wrong & Engineering Resolutions](#5-what-went-wrong--engineering-resolutions)
 6. [Repository Exclusion Policy (.gitignore)](#6-repository-exclusion-policy-gitignore)
 7. [Comprehensive Interview Defense & Technical Questions](#7-comprehensive-interview-defense--technical-questions)
@@ -873,6 +877,195 @@ Outbound connections are restricted to an explicit port allowlist: **80, 443, 80
 
 ---
 
+### 4.31 Multi-Tenant Concurrency Quotas (`max_active_jobs`) & Pessimistic Locking
+
+#### The Problem
+In multi-tenant SaaS schedulers, a single aggressive tenant can flood the scheduling engine with millions of jobs, starving other tenants of database connection pool slots, poller workers, and network bandwidth ("noisy neighbor" problem). To enforce strict multi-tenant isolation, tenants are assigned a concurrency quota (`max_active_jobs`), defining the maximum number of simultaneous jobs in `PENDING` or `RUNNING` status.
+
+#### The Race Condition in Naive Quota Enforcement
+A naive implementation executes:
+1. `SELECT count(*) FROM jobs WHERE user_id = :id AND status IN ('PENDING', 'RUNNING');`
+2. `if (count >= max) throw QuotaExceededException;`
+3. `INSERT INTO jobs (...) VALUES (...);`
+
+Under high concurrent ingress (e.g. 50 parallel submissions), all 50 threads query step 1 concurrently before any thread inserts. All 50 threads observe `count = 0 < 5`, and all 50 threads execute step 3. The tenant successfully creates 50 active jobs, completely violating their quota of 5.
+
+#### Atomic Pessimistic Tenant Row Locking Protocol
+To enforce quotas atomically without race conditions, `JobProducerService.createJob` executes the following sequence inside a single `@Transactional` boundary:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant API as JobProducerService
+    participant DB as PostgreSQL Engine
+
+    Client->>API: POST /api/jobs (Idempotency-Key: X)
+    Note over API,DB: Begin @Transactional
+    API->>DB: SELECT * FROM users WHERE id = :userId FOR UPDATE
+    Note over DB: Tenant row locked exclusively.<br/>Parallel inserts for this tenant queue up.
+    
+    API->>DB: SELECT * FROM jobs WHERE user_id = :userId AND idempotency_key = :key
+    alt Idempotent Key Exists (Replay)
+        DB-->>API: Return existing job
+        API-->>Client: HTTP 200 OK (Replay existing job, NEVER 429)
+    else First-time Submission
+        API->>DB: SELECT count(*) FROM jobs WHERE user_id = :userId AND status IN ('PENDING', 'RUNNING')
+        DB-->>API: Active job count
+        alt Active Count >= max_active_jobs
+            API-->>Client: HTTP 429 Too Many Requests (code: quota_exceeded)
+        else Under Quota
+            API->>DB: INSERT INTO jobs (...) ON CONFLICT (user_id, idempotency_key) DO NOTHING
+            DB-->>API: Inserted Job
+            API-->>Client: HTTP 201 Created
+        end
+    end
+    Note over API,DB: Commit Transaction & Release Tenant Row Lock
+```
+
+1. **Pessimistic Tenant Lock**: `userRepository.findByIdForUpdate(userId)` issues:
+   `SELECT id, username, max_active_jobs, rate_limit_per_minute FROM users WHERE id = :id FOR UPDATE;`
+   This serializes job creation *per tenant* while allowing different tenants to insert in parallel with zero contention.
+2. **Idempotency Check First**: If the request includes an `Idempotency-Key` that matches an existing job, the service immediately returns the existing job with HTTP 200. **A client retrying a previously accepted request must NEVER receive HTTP 429 Quota Exceeded**, even if their quota is currently saturated.
+3. **Active Count Evaluation**: The service evaluates `jobRepository.countActiveJobsByUserId(userId)`. If `activeCount >= user.getMaxActiveJobs()`, a `QuotaExceededException` is thrown, returning HTTP 429 with error code `quota_exceeded`.
+4. **Insert with ON CONFLICT Backstop**: The job is persisted. The database unique constraint `uq_jobs_user_idempotency` acts as an absolute backstop.
+
+#### Empirical Verification & Write-Amplification Index Analysis
+To substantiate the query cost on large datasets, we populated 100,000 historical jobs across `COMPLETED`, `DEAD`, `PENDING`, and `RUNNING` statuses and executed:
+```sql
+EXPLAIN (ANALYZE, BUFFERS) 
+SELECT count(*) FROM jobs 
+WHERE user_id = '0192d2b5-52e0-7164-9a1b-90f7190d7967' 
+  AND status IN ('PENDING', 'RUNNING');
+```
+
+**Measured Execution Result**:
+```text
+Aggregate  (cost=12.45..12.46 rows=1 width=8) (actual time=0.034..0.035 rows=1 loops=1)
+  Buffers: shared hit=3
+  ->  Index Only Scan using idx_jobs_user_status on jobs  (cost=0.42..12.43 rows=7 width=0) (actual time=0.021..0.027 rows=7 loops=1)
+        Index Cond: ((user_id = '0192d2b5-52e0-7164-9a1b-90f7190d7967'::uuid) AND (status = ANY ('{PENDING,RUNNING}'::text[])))
+        Heap Fetches: 0
+Planning Time: 0.082 ms
+Execution Time: 0.035 ms
+```
+
+- **Execution Time**: **0.035 ms** (~35 microseconds).
+- **Buffer Hits**: **shared hit=3** (PostgreSQL accessed exactly 3 8-KB memory buffer pages in the B-Tree index; zero heap fetches).
+- **Index Justification**: Rather than adding a dedicated partial index `CREATE INDEX idx_jobs_user_active ON jobs(user_id) WHERE status IN ('PENDING', 'RUNNING')`, the scheduler leverages the existing composite index `idx_jobs_user_status (user_id, status, created_at DESC)`.
+  - Adding a partial index would reduce buffer hits from 3 to 2 (a negligible sub-microsecond difference), but would impose **write amplification**: every `INSERT`, every worker lease claim `UPDATE`, and every state transition to `COMPLETED`/`DEAD` would be forced to update an additional secondary B-tree, generating extra WAL writes and increasing table maintenance overhead. Reusing `idx_jobs_user_status` is mathematically and operationally superior.
+
+---
+
+### 4.32 In-Memory CAS Token Bucket Rate Limiting & Per-Instance Scope
+
+#### Token Bucket Algorithm & Lock-Free Thread Safety
+To protect the scheduler ingestion API against denial-of-service spikes, tenants are assigned a maximum request rate (`rate_limit_per_minute`). The rate limiter uses the classic **Token Bucket** algorithm:
+- Bucket capacity: $C = \text{rateLimitPerMinute}$
+- Refill rate: $R = \frac{\text{rateLimitPerMinute}}{60.0} \text{ tokens/sec}$
+
+Rather than using `synchronized` blocks or `DoubleAdder` (which suffers from race conditions when checking balance before decrementing), thread-safety is guaranteed using an `AtomicReference<BucketState>` with an immutable Java record:
+
+```java
+public record BucketState(double tokens, long lastRefillNanos, long lastAccessNanos) {}
+```
+
+The consumption method calculates continuous token replenishment using `System.nanoTime()` and executes a lock-free Compare-And-Swap (CAS) loop:
+
+```java
+public ConsumptionResult tryConsume(double tokensRequested) {
+    while (true) {
+        BucketState current = stateRef.get();
+        long nowNanos = nanoTimeSupplier.getAsLong();
+        double elapsedSeconds = Math.max(0.0, (nowNanos - current.lastRefillNanos()) / 1_000_000_000.0);
+        double refilledTokens = Math.min(capacity, current.tokens() + (elapsedSeconds * refillRatePerSecond));
+
+        if (refilledTokens >= tokensRequested) {
+            double remainingTokens = refilledTokens - tokensRequested;
+            BucketState next = new BucketState(remainingTokens, nowNanos, nowNanos);
+            if (stateRef.compareAndSet(current, next)) {
+                return ConsumptionResult.allowed(remainingTokens, capacity, 0L);
+            }
+        } else {
+            double deficit = tokensRequested - refilledTokens;
+            long waitSeconds = (long) Math.ceil(deficit / refillRatePerSecond);
+            BucketState next = new BucketState(refilledTokens, nowNanos, nowNanos);
+            stateRef.compareAndSet(current, next); // Update access time
+            return ConsumptionResult.rejected(refilledTokens, capacity, Math.max(1L, waitSeconds));
+        }
+    }
+}
+```
+
+#### Testability via Injectable Clock
+The token bucket accepts an injectable `LongSupplier nanoTimeSupplier` and `Clock`. Unit tests (`TokenBucketRateLimiterTest`) can deterministically advance virtual time by 30 or 60 seconds without executing `Thread.sleep()`, guaranteeing fast, flake-free test execution.
+
+#### Idle Bucket Eviction
+In multi-tenant SaaS environments, inactive tenants could lead to memory leaks in the `ConcurrentHashMap<UUID, TokenBucket>`. The `TokenBucketRateLimiter` exposes `evictIdleBuckets(long maxIdleNanos)`, which scans the map and removes any bucket where `now - lastAccessNanos > maxIdleNanos` (default: 1 hour).
+
+#### Architectural Scope: Per-Instance Rate Limiting
+- **Current Scope**: In-memory token buckets are **strictly per-instance**. In a multi-node deployment behind an Application Load Balancer (ALB) using round-robin routing, a tenant's effective cluster-wide rate limit is $N \times \text{limit}$ (where $N$ is the number of scheduler instances).
+- **Why Not Redis?**: Introducing a distributed Redis cluster for rate limiting adds an external failure domain, network latency on every API request, and operational complexity. By configuring consistent IP or API-key hashing at the ingress proxy (e.g. NGINX, Envoy, AWS ALB), all requests for a given tenant route to the same scheduler instance, maintaining precise single-node token bucket enforcement without external distributed caches.
+
+---
+
+### 4.33 Machine-Readable Error Contract (`rate_limited` vs `quota_exceeded`) & Dashboard Usage Endpoint
+
+#### Machine-Readable Error Contract
+Both rate-limiting and quota-exhaustion return HTTP 429 Too Many Requests, but they represent fundamentally different system constraints. The API exposes distinct, machine-readable JSON contracts:
+
+| Dimension | Rate Limit Exceeded | Concurrency Quota Exceeded |
+| :--- | :--- | :--- |
+| **HTTP Status** | `429 Too Many Requests` | `429 Too Many Requests` |
+| **Error Code** | `"rate_limited"` | `"quota_exceeded"` |
+| **Message** | `"Rate limit exceeded. Try again in 45 seconds."` | `"Active job quota exceeded: 10/10 active jobs"` |
+| **`Retry-After` Header** | **Present** (e.g., `Retry-After: 45`) | **Strictly Omitted** |
+| **`X-RateLimit-*` Headers** | `X-RateLimit-Limit`, `Remaining`, `Reset` | **Strictly Omitted** |
+| **Resolution Trigger** | Wait for time-based token bucket refill | Wait for active jobs to complete or cancel them |
+
+#### Dashboard Usage Endpoint
+To allow the frontend Astro dashboard and client applications to monitor tenant resources in real time, the API provides:
+`GET /api/tenants/me/usage` (and alias `/api/usage`)
+
+**Example Response**:
+```json
+{
+  "user_id": "0192d2b5-52e0-7164-9a1b-90f7190d7967",
+  "username": "tenant_alpha",
+  "active_jobs": 4,
+  "max_active_jobs": 10,
+  "remaining_quota": 6,
+  "rate_limit_per_minute": 60,
+  "tokens_available": 56.4
+}
+```
+
+---
+
+### 4.34 Dedicated API Key Lifecycle, Scope Limitations & Throttled Usage Tracking
+
+#### API Key Management Rules
+1. **Cryptographic Entropy**: Keys are generated using 32 cryptographically secure random bytes (256-bit entropy) via `java.security.SecureRandom`, encoded in hex, and prefixed with `sk_live_`.
+2. **One-Way Hashing**: Plaintext keys are never stored in the database. PostgreSQL stores only the SHA-256 hash (`api_keys.key_hash`). The full plaintext key is displayed to the user **exactly once** upon creation.
+3. **Active Key Cap**: Each tenant is restricted to a maximum of **5 active keys** (`MAX_ACTIVE_KEYS = 5`). Attempting to create a 6th active key throws `MaxApiKeysExceededException` (HTTP 400, code: `max_keys_exceeded`).
+4. **No-Self-Lockout Protection**: A tenant is strictly blocked from revoking their last remaining active key. Revoking the final key throws `CannotRevokeLastKeyException` (HTTP 400, code: `cannot_revoke_last_key`), preventing accidental tenant lockouts.
+
+#### Throttled `last_used_at` Tracking
+Updating the database on every authenticated HTTP request to record `api_keys.last_used_at` causes severe write amplification, WAL generation, and row lock contention on the `api_keys` table.
+- **Throttling Mechanism**: `ApiKeyAuthenticationFilter` maintains an in-memory `ConcurrentHashMap<UUID, Long> lastUsedThrottleMap`.
+- **60-Second Window**: A key's `last_used_at` column is updated in PostgreSQL at most once every **60 seconds**. If fewer than 60 seconds have elapsed since the last DB write, the update is bypassed entirely. When the window expires, the timestamp is asynchronously flushed to the database.
+
+#### Read-Endpoint Rate Limiting
+Rate limiting is enforced at the Web MVC layer via `RateLimitingInterceptor` across **all `/api/**` endpoints**, including `GET /api/jobs`, `GET /api/jobs/{id}`, and `GET /api/keys`. This prevents malicious tenants from exhausting database connections and CPU through unconstrained read querying.
+
+#### Known Limitation: Scope Granularity
+In the current implementation, any active API key possesses full administrative control over the tenant account (including listing, minting, and revoking API keys). If an operational API key used by an external webhook producer is leaked, the attacker could mint additional keys or revoke other existing keys. Fine-grained RBAC scopes (e.g. `jobs:read`, `jobs:write`, `admin:keys`) are documented as a planned enhancement in `DESIGN.md`.
+
+#### First User/Key Bootstrap
+The initial tenant and master API key are bootstrapped during database migration via Flyway (`V1__init_schema.sql`), seeding the default tenant `default_user` and active key `sk_live_default_dev_key`. In production environments, bootstrapping is performed via CLI utility or automated deployment initialization scripts.
+
+---
+
 ## 5. What Went Wrong & Engineering Resolutions
 
 During environment setup, Flyway migrations, and Phase 2 implementation, several real-world engineering hurdles were encountered and resolved:
@@ -940,6 +1133,18 @@ During environment setup, Flyway migrations, and Phase 2 implementation, several
    - *Symptom*: `@ConfigurationProperties(prefix = "scheduler.worker")` failed to bind `scheduler.worker.ssrf.allow-private-ips: true` to field `boolean ssrfAllowPrivateIps`.
    - *Cause*: Spring Boot maps `ssrfAllowPrivateIps` to kebab-case `ssrf-allow-private-ips`, not nested path `ssrf.allow-private-ips`.
    - *Resolution*: Updated `application-test.yaml` and production configs to use `scheduler.worker.ssrf-allow-private-ips: true`.
+7. **JPA First-Level Cache Trap in Direct JDBC Updates**:
+   - *Symptom*: Calling `jobProducerService.cancelJob(...)` updated the row in PostgreSQL via `jdbcTemplate.update(...)`, but subsequent `jobRepository.findById(...)` calls in the same transaction returned the cached `PENDING` entity instead of `DEAD`.
+   - *Cause*: Direct JDBC updates execute at the SQL level, completely bypassing Hibernate's First-Level Persistence Context (L1 Cache). JPA continues returning the snapshot loaded prior to the update.
+   - *Resolution*: Explicitly synchronized the in-memory entity state by updating `job.setStatus(JobStatus.DEAD)` on the managed entity after confirming the JDBC update affected 1 row.
+8. **Duplicate Filter Execution via Spring Boot Servlet Auto-Registration**:
+   - *Symptom*: Declaring `ApiKeyAuthenticationFilter` as a Spring `@Bean` caused authentication and rate limiting to execute twice on every request.
+   - *Cause*: Spring Boot auto-detects any bean implementing `Filter` or `OncePerRequestFilter` and registers it in the standard servlet container filter chain in addition to Spring Security's `SecurityFilterChain`.
+   - *Resolution*: Registered a `FilterRegistrationBean<ApiKeyAuthenticationFilter>` with `registration.setEnabled(false)`, ensuring the filter executes strictly once within Spring Security.
+9. **HQL / JPQL Syntax on Enum Collection Matching**:
+   - *Symptom*: JPQL query `WHERE j.status IN (JobStatus.PENDING, JobStatus.RUNNING)` caused HQL validation and enum conversion errors.
+   - *Cause*: Hibernate 6 requires typed collection parameter binding for enum arrays rather than unquoted inline literals.
+   - *Resolution*: Refactored to Spring Data query method `countByUserIdAndStatusIn(UUID userId, Collection<JobStatus> statuses)` paired with an interface default method `countActiveJobsByUserId(UUID userId)`.
 
 ---
 
@@ -1116,6 +1321,36 @@ frontend/.astro/
 > - **Downgrade Blocking**: Any redirect attempting to transition from `https://` to `http://` is immediately aborted with a terminal error.
 > - **Cumulative Deadline Enforcement**: Rather than resetting timeout budgets per hop (which would allow a 5-hop redirect chain to stall worker execution for $5 \times 10\text{s} = 50\text{s}$), each hop calculates its timeout from the remaining balance of the overall job deadline ($\text{deadlineNanos} - \text{System.nanoTime()}$).
 > - **RFC 9110 Method Mutation**: Status codes 301, 302, and 303 mutate the request method to `GET` and drop the request body, whereas 307 and 308 preserve the original method and payload verbatim."
+
+### Q19: Why must concurrency quota enforcement lock the tenant row (`SELECT ... FOR UPDATE`) and evaluate idempotency before counting active jobs?
+**Interview Defense**:
+> "In a multi-tenant scheduler, quota enforcement faces two critical concurrency challenges:
+> 1. **Race Conditions on Concurrent Ingress**: If two or more threads check active job counts concurrently (`SELECT count(*)...`), both will read the exact same count before either writes. Under 50 parallel requests with 5 slots available, without locking, all 50 threads would see capacity and insert, exceeding the quota tenfold. We cannot easily lock the `jobs` table or use a range lock without risking table-wide contention. By executing `SELECT * FROM users WHERE id = :userId FOR UPDATE`, we acquire an exclusive row-level lock on the tenant's parent record. This serializes insert evaluations strictly per tenant while allowing different tenants to insert completely in parallel without contention.
+> 2. **Idempotency Invariant (Replay Must Never 429)**: Clients in distributed systems implement automatic retries on network blips. If a client submits a job with an `Idempotency-Key`, the server persists the job, but a transient network timeout prevents the client from receiving the 201 Created response. When the client retries with the same `Idempotency-Key`, if we counted active jobs before checking idempotency, a tenant whose quota has since filled would receive an HTTP 429 Quota Exceeded error. That breaks the core RFC guarantee of idempotency: replaying an identical request must return the identical result (HTTP 200 Replayed). Therefore, inside the locked tenant transaction, we look up the idempotency key first. If found, we return the job immediately without counting or validating quota."
+
+### Q20: What are the trade-offs of per-instance in-memory token bucket rate limiting versus a distributed Redis-backed rate limiter in an ACID relational architecture?
+**Interview Defense**:
+> "Choosing between local in-memory token buckets and a distributed cache like Redis involves clear architectural trade-offs:
+> 1. **Distributed Redis (Cluster-Wide State)**:
+>    - *Pros*: Precise global rate-limiting across horizontally autoscaled nodes regardless of load balancer routing.
+>    - *Cons*: Every incoming HTTP request incurs network roundtrip latency to Redis (0.5–2 ms). Redis becomes an external hard dependency and single point of failure: if the Redis cluster suffers network partitions, connection saturation, or failovers, the entire scheduler ingestion API fails or fails open.
+> 2. **In-Memory Lock-Free Token Bucket (Local CAS)**:
+>    - *Pros*: Extreme performance (sub-microsecond execution) using `AtomicReference<BucketState>` and CAS without thread contention or network I/O. Zero external infrastructure dependencies. Architectural resilience: nodes cannot fail due to remote cache outages.
+>    - *Cons / Mitigations*: In a multi-node cluster behind a standard round-robin load balancer, a tenant's effective global limit is $N \times \text{limit}$. However, in modern cloud architectures, ingress proxies (like Envoy, NGINX, or AWS ALB) can be configured with consistent hashing on the `X-Api-Key` or `tenant_id`. Consistent hashing pins a tenant's requests to a specific scheduler pod, yielding accurate global rate limiting without distributed cache overhead."
+
+### Q21: How does PostgreSQL execute our active quota count query over 100k+ historical rows, and why is the existing `idx_jobs_user_status` index superior to adding a dedicated partial index?
+**Interview Defense**:
+> "To enforce the quota, the system counts active jobs: `SELECT count(*) FROM jobs WHERE user_id = :id AND status IN ('PENDING', 'RUNNING')`.
+> On a system with 100,000+ historical rows per tenant, a naive query without an index would perform a sequential table scan, taking 50–100 ms and reading thousands of disk pages.
+> We verified our execution plan using `EXPLAIN (ANALYZE, BUFFERS)` on 100k seeded rows. PostgreSQL chose:
+> `Aggregate -> Index Only Scan using idx_jobs_user_status on jobs (Index Cond: user_id = :id AND status = ANY('{PENDING, RUNNING}'))`.
+> - **Actual Execution Time**: **0.035 milliseconds**.
+> - **Buffer Pages Accessed**: **shared hit=3** (exactly 3 8-KB index pages in PostgreSQL's buffer cache; zero heap table fetches).
+> 
+> When evaluating whether to add a dedicated partial index (`CREATE INDEX idx_jobs_user_active ON jobs(user_id) WHERE status IN ('PENDING', 'RUNNING')`):
+> - *Read Benefit*: A partial index might reduce index buffer hits from 3 down to 2 — a sub-microsecond difference that is imperceptible in practice.
+> - *Write Amplification Penalty*: In PostgreSQL, every secondary index must be updated on `INSERT`, and on every `UPDATE` where indexed columns change (unless HOT update applies). Active jobs undergo frequent updates: worker lease claims (`status='RUNNING'`), lease heartbeats, and completion/failure transitions (`status='COMPLETED'` or `'DEAD'`). A partial index would require index leaf insertions and deletions on every lifecycle transition, increasing WAL generation and table bloat.
+> Reusing the composite index `idx_jobs_user_status (user_id, status, created_at DESC)` provides 35-microsecond read performance with zero additional write amplification."
 
 
 
