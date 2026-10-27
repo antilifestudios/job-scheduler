@@ -35,6 +35,71 @@ public class GlobalExceptionHandler {
         return buildErrorResponse(HttpStatus.NOT_FOUND, ex.getMessage());
     }
 
+    @ExceptionHandler(QuotaExceededException.class)
+    public ResponseEntity<Map<String, Object>> handleQuotaExceeded(QuotaExceededException ex) {
+        // Notice: strictly NO Retry-After or X-RateLimit-* headers on quota limits
+        Map<String, Object> body = Map.of(
+            "timestamp", Instant.now().toString(),
+            "status", HttpStatus.TOO_MANY_REQUESTS.value(),
+            "code", "quota_exceeded",
+            "message", ex.getMessage(),
+            "maxActiveJobs", ex.getMaxActiveJobs(),
+            "activeJobs", ex.getActiveJobs()
+        );
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
+    }
+
+    @ExceptionHandler(RateLimitException.class)
+    public ResponseEntity<Map<String, Object>> handleRateLimit(RateLimitException ex) {
+        // Retry-After and X-RateLimit-* headers are emitted exclusively for rate limits
+        Map<String, Object> body = Map.of(
+            "timestamp", Instant.now().toString(),
+            "status", HttpStatus.TOO_MANY_REQUESTS.value(),
+            "code", "rate_limited",
+            "message", ex.getMessage(),
+            "retryAfterSeconds", ex.getRetryAfterSeconds()
+        );
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+            .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+            .header("X-RateLimit-Limit", String.valueOf(ex.getLimit()))
+            .header("X-RateLimit-Remaining", String.valueOf(ex.getRemaining()))
+            .header("X-RateLimit-Reset", String.valueOf(ex.getResetEpochSeconds()))
+            .body(body);
+    }
+
+    @ExceptionHandler(MaxApiKeysExceededException.class)
+    public ResponseEntity<Map<String, Object>> handleMaxKeys(MaxApiKeysExceededException ex) {
+        Map<String, Object> body = Map.of(
+            "timestamp", Instant.now().toString(),
+            "status", HttpStatus.CONFLICT.value(),
+            "code", "max_keys_exceeded",
+            "message", ex.getMessage()
+        );
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
+
+    @ExceptionHandler(CannotRevokeLastKeyException.class)
+    public ResponseEntity<Map<String, Object>> handleCannotRevokeLastKey(CannotRevokeLastKeyException ex) {
+        Map<String, Object> body = Map.of(
+            "timestamp", Instant.now().toString(),
+            "status", HttpStatus.CONFLICT.value(),
+            "code", "cannot_revoke_last_key",
+            "message", ex.getMessage()
+        );
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
+
+    @ExceptionHandler(JobCancellationException.class)
+    public ResponseEntity<Map<String, Object>> handleJobCancellation(JobCancellationException ex) {
+        Map<String, Object> body = Map.of(
+            "timestamp", Instant.now().toString(),
+            "status", HttpStatus.CONFLICT.value(),
+            "code", "job_cancellation_conflict",
+            "message", ex.getMessage()
+        );
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> handleGeneric(Exception ex) {
         log.error("Unhandled internal server error: {}", ex.getMessage(), ex);

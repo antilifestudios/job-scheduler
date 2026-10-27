@@ -200,3 +200,76 @@ OkHttp's automatic redirects are disabled (`followRedirects(false)`). The worker
    - Connection attempts to unresponsive private IPs might take longer to time out than refused connections, theoretically enabling network topology timing attacks if connect timeouts are large. We mitigate this by bounding connect timeout to 2–5 seconds.
 3. **Client Certificates & Mutual TLS (mTLS)**:
    - Client certificate authentication is currently global per worker rather than per-job. Per-tenant mTLS keys require custom SSLContext mapping.
+4. **Leaked-Key-Can-Mint-Keys Limitation**:
+   - All tenant API keys currently share full tenant administrative scope. An attacker possessing a valid API key can invoke `POST /api/keys` to mint additional keys or revoke other keys. In an enterprise RBAC model, key scopes (`jobs:write`, `jobs:read`, `keys:admin`) or a separate root account credential would be required to manage keys.
+
+---
+
+## 9. Multi-Tenancy, Quotas & API Key Architecture
+
+### 9.1 Atomic Quota Enforcement Protocol
+To prevent noisy neighbors from exhausting the shared worker engine and database storage, each tenant is assigned a concurrency quota (`users.max_active_jobs`, default: 100).
+
+```text
+ 1. BEGIN TRANSACTION (in JobProducerService.createJob)
+ 2. SELECT ... FROM users WHERE id = :userId FOR UPDATE;  <-- Serializes concurrent submits for this tenant
+ 3. IF idempotency_key IS NOT NULL:
+       SELECT ... FROM jobs WHERE user_id = :userId AND idempotency_key = :key;
+       IF found -> RETURN 200 OK (Idempotent-Replayed: true);  <-- Idempotency check FIRST (never 429!)
+ 4. SELECT count(*) FROM jobs WHERE user_id = :userId AND status IN ('PENDING', 'RUNNING');
+ 5. IF count >= user.max_active_jobs:
+       ROLLBACK & THROW QuotaExceededException -> RETURN 429 (code: "quota_exceeded", NO rate limit headers)
+ 6. INSERT INTO jobs (...) VALUES (...) ON CONFLICT (user_id, idempotency_key) DO NOTHING;
+ 7. COMMIT;
+```
+
+**Key Invariants**:
+1. **Tenant Serialization**: Locking the tenant row (`SELECT ... FOR UPDATE`) serializes parallel submissions strictly for that specific tenant, leaving other tenants completely unblocked.
+2. **Idempotent Replay Immunity**: If an existing job with the same idempotency key is already stored, the server returns HTTP 200 with `Idempotent-Replayed: true` immediately, even if the tenant is currently at 100% quota utilization.
+3. **Double-Barrier Insertion**: `ON CONFLICT (user_id, idempotency_key) ... DO NOTHING` remains active as an ACID backstop against race conditions.
+
+### 9.2 Token Bucket Rate Limiting (In-Memory CAS)
+- **Per-Instance Architecture**: The rate limiter is strictly in-memory and per-instance. It requires zero Redis or external broker dependencies.
+- **Lock-Free Atomic State**: Uses `AtomicReference<BucketState>` where `record BucketState(double tokens, long lastRefillNanos, long lastAccessNanos)`. Token refilling and consumption execute via lock-free CAS loops without thread contention.
+- **Injectable Clocks**: Relies on `LongSupplier nanoTimeSupplier` and `Clock`, enabling deterministic testing without thread sleeps.
+- **Idle Eviction**: Buckets idle for $>10$ minutes are purged periodically via `@Scheduled` tasks to prevent unbounded memory growth.
+- **Distinct Error Contract**:
+  - `rate_limited` on 429: Returns `Retry-After: <seconds>`, `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`, `X-RateLimit-Reset: <epoch_seconds>`.
+  - `quota_exceeded` on 429: Emits strictly **NO** `Retry-After` or `X-RateLimit-*` headers.
+
+### 9.3 Index Justification & EXPLAIN (ANALYZE, BUFFERS) Benchmark
+To evaluate whether a dedicated partial index `CREATE INDEX idx_jobs_user_active ON jobs (user_id) WHERE status IN ('PENDING', 'RUNNING')` was justified over the existing composite index `CREATE INDEX idx_jobs_user_status ON jobs (user_id, status, created_at DESC)`, we seeded 100,000 completed (`SUCCEEDED`) rows and measured:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) FROM jobs
+WHERE user_id = :userId AND status IN ('PENDING', 'RUNNING');
+```
+
+**Actual PostgreSQL Execution Results**:
+```text
+Aggregate  (cost=23.23..23.24 rows=1 width=8) (actual time=0.019..0.020 rows=1.00 loops=1)
+  Buffers: shared hit=3
+  ->  Index Only Scan using idx_jobs_user_status on jobs  (cost=0.29..23.21 rows=7 width=0) (actual time=0.015..0.016 rows=7.00 loops=1)
+        Index Cond: ((user_id = '...'::uuid) AND (status = ANY ('{PENDING,RUNNING}'::text[])))
+        Heap Fetches: 7
+        Index Searches: 1
+        Buffers: shared hit=3
+Planning Time: 0.194 ms
+Execution Time: 0.031 ms
+```
+
+**Architectural Decision**:
+- The existing composite index `idx_jobs_user_status` already performs an **Index Only Scan**, seeking directly to the `PENDING` and `RUNNING` btree leaf slices.
+- The query executes in **0.031 milliseconds** with only **3 buffer page hits**, completely ignoring the 100,000 historical rows.
+- Adding a dedicated partial index would introduce write amplification (maintenance of another index tree on every insert, heartbeat update, and state transition) with zero tangible read latency benefit. Thus, the existing index is superior.
+
+### 9.4 API Key Management & Throttled Usage Tracking
+- **Active Key Cap**: Capped at 5 active keys per user (`MAX_ACTIVE_KEYS = 5`). Exceeding this limit returns HTTP 409 `max_keys_exceeded`.
+- **Last Key Protection**: Cannot revoke the only active key for a tenant (`cannot_revoke_last_key`).
+- **Throttled `last_used_at`**: `ApiKeyAuthenticationFilter` maintains an in-memory `ConcurrentHashMap<UUID, Long>` throttling database writes to at most once per 60 seconds per key, preventing write storms under high throughput.
+- **Tenant Isolation**: Every query and operation scopes `user_id = :currentUser`. Unauthorized access attempts return HTTP 404 Not Found to prevent tenant data enumeration.
+- **First Key Bootstrapping**:
+  - Development / Local: Automatically bootstrapped via `DevBootstrapRunner` (`@Profile("!test")`), which generates an initial key and prints it once to stdout.
+  - Production: Provisioned via administrative CLI tools or migration scripts.
+

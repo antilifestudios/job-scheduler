@@ -8,7 +8,11 @@ import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
-public record SecurityUser(UUID userId, String username) implements UserDetails {
+public record SecurityUser(UUID userId, String username, int rateLimitPerMinute, int maxActiveJobs) implements UserDetails {
+
+    public SecurityUser(UUID userId, String username) {
+        this(userId, username, 60, 100);
+    }
 
     @Override
     public Collection<? extends GrantedAuthority> getAuthorities() {

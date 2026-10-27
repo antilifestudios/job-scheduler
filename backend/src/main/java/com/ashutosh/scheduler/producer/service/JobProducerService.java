@@ -1,12 +1,16 @@
 package com.ashutosh.scheduler.producer.service;
 
 import com.ashutosh.scheduler.common.exception.IdempotencyConflictException;
+import com.ashutosh.scheduler.common.exception.JobCancellationException;
+import com.ashutosh.scheduler.common.exception.QuotaExceededException;
 import com.ashutosh.scheduler.common.exception.ResourceNotFoundException;
 import com.ashutosh.scheduler.common.util.CryptoUtils;
 import com.ashutosh.scheduler.common.util.UuidV7;
 import com.ashutosh.scheduler.domain.entity.JobEntity;
+import com.ashutosh.scheduler.domain.entity.UserEntity;
 import com.ashutosh.scheduler.domain.enums.JobStatus;
 import com.ashutosh.scheduler.domain.repo.JobRepository;
+import com.ashutosh.scheduler.domain.repo.UserRepository;
 import com.ashutosh.scheduler.producer.dto.CreateJobRequest;
 import com.ashutosh.scheduler.producer.dto.HttpPayloadDto;
 import com.ashutosh.scheduler.producer.dto.JobResponse;
@@ -27,6 +31,7 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 @Service
@@ -35,15 +40,18 @@ public class JobProducerService {
     private static final Logger log = LoggerFactory.getLogger(JobProducerService.class);
 
     private final JobRepository jobRepository;
+    private final UserRepository userRepository;
     private final JdbcTemplate jdbcTemplate;
     private final JobRequestValidator validator;
     private final ObjectMapper objectMapper;
 
     public JobProducerService(JobRepository jobRepository,
+                              UserRepository userRepository,
                               JdbcTemplate jdbcTemplate,
                               JobRequestValidator validator,
                               ObjectMapper objectMapper) {
         this.jobRepository = jobRepository;
+        this.userRepository = userRepository;
         this.jdbcTemplate = jdbcTemplate;
         this.validator = validator;
         this.objectMapper = objectMapper;
@@ -63,6 +71,36 @@ public class JobProducerService {
 
         String requestHash = CryptoUtils.computeRequestHash(method, request.url(), headers, request.body());
 
+        // 1. Lock the tenant row in the transaction to serialize concurrent inserts for this tenant
+        UserEntity user = userRepository.findByIdForUpdate(userId)
+            .orElseThrow(() -> new ResourceNotFoundException("User not found: " + userId));
+
+        // 2. Do the idempotency lookup FIRST: an idempotent replay must return 200, NEVER 429 quota_exceeded
+        if (effectiveIdempotencyKey != null) {
+            Optional<JobEntity> existingOpt = jobRepository.findByUserIdAndIdempotencyKey(userId, effectiveIdempotencyKey);
+            if (existingOpt.isPresent()) {
+                JobEntity existing = existingOpt.get();
+                if (existing.getRequestHash() != null && !existing.getRequestHash().equals(requestHash)) {
+                    throw new IdempotencyConflictException(
+                        "Idempotency key '" + effectiveIdempotencyKey + "' was previously submitted with a different request payload."
+                    );
+                }
+                log.info("Idempotent job replayed: id={}, userId={}, queue={}", existing.getId(), userId, existing.getQueue());
+                return new CreateJobResult(JobResponse.fromEntity(existing, objectMapper), true);
+            }
+        }
+
+        // 3. Count active jobs (PENDING + RUNNING) and enforce quota
+        long activeJobs = jobRepository.countActiveJobsByUserId(userId);
+        if (activeJobs >= user.getMaxActiveJobs()) {
+            throw new QuotaExceededException(
+                "Active job quota of " + user.getMaxActiveJobs() + " exceeded. Current active jobs: " + activeJobs + ".",
+                user.getMaxActiveJobs(),
+                activeJobs
+            );
+        }
+
+        // 4. Insert the new job with ON CONFLICT as backstop
         HttpPayloadDto payloadDto = new HttpPayloadDto(request.url(), method, headers, null);
         String payloadJson;
         try {
@@ -105,7 +143,6 @@ public class JobProducerService {
                     );
                 }
 
-                // Never log headers or bodies!
                 log.info("Idempotent job replayed: id={}, userId={}, queue={}", existing.getId(), userId, existing.getQueue());
                 return new CreateJobResult(JobResponse.fromEntity(existing, objectMapper), true);
             }
@@ -135,6 +172,34 @@ public class JobProducerService {
             .orElseThrow(() -> new IllegalStateException("Newly inserted job could not be retrieved"));
 
         return new CreateJobResult(JobResponse.fromEntity(createdEntity, objectMapper), false);
+    }
+
+    @Transactional
+    public JobResponse cancelJob(UUID jobId, UUID userId) {
+        JobEntity job = jobRepository.findByIdAndUserId(jobId, userId)
+            .orElseThrow(() -> new ResourceNotFoundException("Job not found: " + jobId));
+
+        if (job.getStatus() != JobStatus.PENDING) {
+            throw new JobCancellationException("Cannot cancel job " + jobId + " in status " + job.getStatus() + ". Only PENDING jobs can be cancelled.");
+        }
+
+        String cancelSql = """
+            UPDATE jobs
+            SET status = 'DEAD',
+                last_error = 'Cancelled by user',
+                updated_at = now()
+            WHERE id = ? AND user_id = ? AND status = 'PENDING'
+            """;
+        int updated = jdbcTemplate.update(cancelSql, jobId, userId);
+        if (updated == 0) {
+            throw new JobCancellationException("Job was claimed or modified concurrently; cannot cancel.");
+        }
+
+        job.setStatus(JobStatus.DEAD);
+        job.setLastError("Cancelled by user");
+        job.setUpdatedAt(Instant.now());
+        log.info("Job cancelled: id={}, userId={}", jobId, userId);
+        return JobResponse.fromEntity(job, objectMapper);
     }
 
     @Transactional(readOnly = true)

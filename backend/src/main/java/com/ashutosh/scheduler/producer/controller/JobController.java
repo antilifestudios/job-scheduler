@@ -71,4 +71,12 @@ public class JobController {
         PageResponse<JobResponse> response = jobProducerService.listJobs(currentUser.userId(), status, queue, page, size);
         return ResponseEntity.ok(response);
     }
+
+    @PostMapping("/{id}/cancel")
+    public ResponseEntity<JobResponse> cancelJob(
+            @AuthenticationPrincipal SecurityUser currentUser,
+            @PathVariable UUID id) {
+        JobResponse response = jobProducerService.cancelJob(id, currentUser.userId());
+        return ResponseEntity.ok(response);
+    }
 }

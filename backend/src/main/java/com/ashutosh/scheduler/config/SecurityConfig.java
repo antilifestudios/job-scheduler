@@ -23,7 +23,19 @@ public class SecurityConfig {
     }
 
     @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    public ApiKeyAuthenticationFilter apiKeyAuthenticationFilter() {
+        return new ApiKeyAuthenticationFilter(apiKeyRepository);
+    }
+
+    @Bean
+    public org.springframework.boot.web.servlet.FilterRegistrationBean<ApiKeyAuthenticationFilter> apiKeyFilterRegistration(ApiKeyAuthenticationFilter filter) {
+        var registration = new org.springframework.boot.web.servlet.FilterRegistrationBean<>(filter);
+        registration.setEnabled(false);
+        return registration;
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http, ApiKeyAuthenticationFilter apiKeyFilter) throws Exception {
         http
             .csrf(AbstractHttpConfigurer::disable)
             .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
@@ -41,7 +53,7 @@ public class SecurityConfig {
                 .requestMatchers("/api/**").authenticated()
                 .anyRequest().authenticated()
             )
-            .addFilterBefore(new ApiKeyAuthenticationFilter(apiKeyRepository), UsernamePasswordAuthenticationFilter.class);
+            .addFilterBefore(apiKeyFilter, UsernamePasswordAuthenticationFilter.class);
 
         return http.build();
     }
