@@ -1,6 +1,6 @@
 # Reliable HTTP Job Scheduler — Architecture & Technical Design Document
 
-> **Document Version:** 1.6.0 (Phase 7 Multi-Tenancy, Quotas & Rate Limiting)  
+> **Document Version:** 1.7.0 (Phase 8 Recurring Cron Schedules)  
 > **Status:** Active / Under Iterative Development  
 > **Target Audience:** Engineering Mentors, Backend System Designers, Technical Interviewers  
 
@@ -50,6 +50,12 @@
    - [4.32 In-Memory CAS Token Bucket Rate Limiting & Per-Instance Scope](#432-in-memory-cas-token-bucket-rate-limiting--per-instance-scope)
    - [4.33 Machine-Readable Error Contract (`rate_limited` vs `quota_exceeded`) & Dashboard Usage Endpoint](#433-machine-readable-error-contract-rate_limited-vs-quota_exceeded--dashboard-usage-endpoint)
    - [4.34 Dedicated API Key Lifecycle, Scope Limitations & Throttled Usage Tracking](#434-dedicated-api-key-lifecycle-scope-limitations--throttled-usage-tracking)
+   - [4.35 Recurring Cron Blueprint Architecture & Separation from Execution Instances](#435-recurring-cron-blueprint-architecture--separation-from-execution-instances)
+   - [4.36 Misfire Recovery Protocol (`FIRE_ONCE` vs `SKIP`), Grace Windows & Downtime Thundering Herd Defense](#436-misfire-recovery-protocol-fire_once-vs-skip-grace-windows--downtime-thundering-herd-defense)
+   - [4.37 Global Lock Hierarchy Invariant (`Schedule -> Tenant -> Job`) & Zero-Deadlock Guarantee](#437-global-lock-hierarchy-invariant-schedule---tenant---job--zero-deadlock-guarantee)
+   - [4.38 Timezone Semantics, IANA Validation & Daylight Saving Time (DST) Transitions](#438-timezone-semantics-iana-validation--daylight-saving-time-dst-transitions)
+   - [4.39 Poison Schedule Isolation, Auto-Disable Failure Tracking & Circuit Breaking](#439-poison-schedule-isolation-auto-disable-failure-tracking--circuit-breaking)
+   - [4.40 Partial Indexing for $O(1)$ Overlap Checks (`idx_jobs_schedule_active`) & EXPLAIN Benchmark](#440-partial-indexing-for-o1-overlap-checks-idx_jobs_schedule_active--explain-benchmark)
 5. [What Went Wrong & Engineering Resolutions](#5-what-went-wrong--engineering-resolutions)
 6. [Repository Exclusion Policy (.gitignore)](#6-repository-exclusion-policy-gitignore)
 7. [Comprehensive Interview Defense & Technical Questions](#7-comprehensive-interview-defense--technical-questions)
@@ -1066,6 +1072,166 @@ The initial tenant and master API key are bootstrapped during database migration
 
 ---
 
+### 4.35 Recurring Cron Blueprint Architecture & Separation from Execution Instances
+
+#### Separation of Blueprint from Execution Instances
+In an asynchronous scheduler, recurring tasks are divided into two distinct domain concepts:
+1. **The Blueprint (`schedules`)**: The persistent definition containing the cron expression, timezone, overlap policy, misfire policy, failure counters, and the job template JSON.
+2. **The Execution Instance (`jobs`)**: The discrete, ephemeral work unit that is spawned for a specific execution tick and progresses through the lifecycle (`PENDING -> RUNNING -> SUCCEEDED / DEAD`).
+
+Spawned jobs maintain a foreign key back to their blueprint: `jobs.schedule_id REFERENCES schedules(id) ON DELETE SET NULL`. If a user deletes a schedule (`DELETE /api/schedules/{id}`), historical job execution records, attempt logs, and audit data remain completely intact with `schedule_id = NULL`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Poller as CronSchedulerEngine
+    participant Proc as CronScheduleProcessor (REQUIRES_NEW)
+    participant DB as PostgreSQL Engine
+    participant Queue as jobs Table
+
+    Note over Poller,DB: Periodic Tick (time budget = 2000ms)
+    Poller->>DB: SELECT * FROM schedules WHERE enabled = TRUE AND next_run_at <= now() ORDER BY next_run_at ASC LIMIT 25 FOR UPDATE SKIP LOCKED
+    Note over DB: Claimed schedule rows locked exclusively.
+    
+    loop For Each Claimed Schedule
+        Poller->>Proc: processSchedule(scheduleId, now)
+        Proc->>DB: SELECT * FROM schedules WHERE id = :id FOR UPDATE
+        alt Schedule Disabled or next_run_at > now
+            Note over Proc: Already processed by another worker; exit
+        else Schedule Due
+            Proc->>DB: SELECT * FROM users WHERE id = :userId FOR UPDATE
+            Note over DB: Global Lock Order: Schedule -> Tenant
+            
+            alt Misfire Delay > grace_window AND misfire_policy == SKIP
+                Proc->>DB: UPDATE schedules SET last_skip_reason = 'MISFIRE_SKIP', next_run_at = cron.next(now)
+            else Overlap SKIP AND active job exists
+                Proc->>DB: UPDATE schedules SET last_skip_reason = 'OVERLAP_SKIP', next_run_at = cron.next(now)
+            else Active jobs >= max_active_jobs
+                Proc->>DB: UPDATE schedules SET last_skip_reason = 'QUOTA_SKIP', next_run_at = cron.next(now)
+            else Spawn Eligible
+                Proc->>Queue: INSERT INTO jobs (schedule_id, idempotency_key, ...) ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+                Proc->>DB: UPDATE schedules SET consecutive_failures = 0, last_fired_at = now, next_run_at = cron.next(now)
+            end
+        end
+    end
+```
+
+#### Deterministic Idempotency Key & Reserved Prefix
+Every spawned cron job receives a deterministic idempotency key derived from the schedule ID and the target execution epoch:
+$$\text{idempotency\_key} = \text{"cron:"} + \text{schedule.id} + \text{":"} + \text{targetTick.toEpochSecond()}$$
+
+Because the database enforces `idx_jobs_user_idempotency` with `ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`, duplicate spawns are impossible even during concurrent worker races or partial system crashes. The `"cron:"` prefix is strictly reserved: client requests to `POST /api/jobs` specifying an idempotency key starting with `"cron:"` are rejected with HTTP 400 (`ValidationException`).
+
+#### Time-Budget Drain Sweeper
+Rather than claiming a fixed batch of 10 rows and sleeping, `CronSchedulerEngine` operates a time-budgeted drain loop. If thousands of schedules trigger at the top of an hour (e.g. `0 0 * * * *`), the engine continuously claims batches of 25 until either no due schedules remain or the allocated time budget (default: 2,000 ms) is reached, preventing schedule starvation without starving worker threads.
+
+---
+
+### 4.36 Misfire Recovery Protocol (`FIRE_ONCE` vs `SKIP`), Grace Windows & Downtime Thundering Herd Defense
+
+#### The Downtime Thundering Herd Problem
+If a scheduler cluster goes offline for 3 hours (e.g. maintenance window or database upgrade), an every-minute recurring schedule misses 180 ticks. If the scheduler blindly fires all missed ticks upon restart, 180 duplicate jobs are queued simultaneously, attacking the downstream webhook target with a massive thundering herd.
+
+#### Misfire Recovery Engine
+The scheduler implements a configurable misfire recovery policy:
+- `grace_window_seconds` (default: 300 seconds = 5 minutes): The window within which an execution is considered on-time.
+- If $\text{delay} = \text{now} - \text{next\_run\_at} \le \text{grace\_window\_seconds}$: The execution is on-time and fires normally.
+- If $\text{delay} > \text{grace\_window\_seconds}$: A misfire has occurred.
+  - `misfire_policy = 'SKIP'`: All missed ticks are discarded. The engine records `last_skip_reason = 'MISFIRE_SKIP'`, updates `last_tick_at = now`, and advances `next_run_at = cron.next(now)` (the first tick strictly after now).
+  - `misfire_policy = 'FIRE_ONCE'`: The engine identifies the **single most recent missed tick strictly before now**, spawns exactly one catch-up job for that tick with idempotency key `"cron:" + id + ":" + latestMissedTickEpoch`, and advances `next_run_at = cron.next(now)`.
+- **Resume After Pause**: When a paused schedule is resumed (`PATCH /api/schedules/{id}` with `enabled: true`), `next_run_at` is recalculated from the current instant (`cron.next(now)`), ensuring old historical ticks are never executed.
+
+---
+
+### 4.37 Global Lock Hierarchy Invariant (`Schedule -> Tenant -> Job`) & Zero-Deadlock Guarantee
+
+In high-concurrency systems, deadlocks occur when transactions acquire locks in conflicting orders (e.g. Transaction 1 locks Tenant A then Schedule 1, while Transaction 2 locks Schedule 1 then Tenant A).
+
+To guarantee zero deadlocks across background cron sweepers, manual trigger endpoints (`POST /api/schedules/{id}/trigger`), and direct job creation (`POST /api/jobs`), the system enforces a strict global lock hierarchy:
+
+$$\text{1. Schedule Row Lock } (SELECT \dots FOR\ UPDATE) \longrightarrow \text{2. Tenant Row Lock } (SELECT \dots FOR\ UPDATE) \longrightarrow \text{3. Job Insert}$$
+
+1. **Schedule Lock**: Acquired first via `scheduleRepository.findByIdForUpdate(scheduleId)`.
+2. **Tenant Lock**: Acquired second via `userRepository.findByIdForUpdate(userId)`.
+3. **Active Quota Count**: Evaluated only after holding both locks.
+4. **Job Persist**: Executed with `ON CONFLICT DO NOTHING`.
+
+Direct job submissions (`POST /api/jobs`) do not involve schedules and acquire lock 2 directly. Because all schedule-related transactions acquire Lock 1 before Lock 2, circular lock dependencies are mathematically impossible.
+
+---
+
+### 4.38 Timezone Semantics, IANA Validation & Daylight Saving Time (DST) Transitions
+
+#### Strict IANA Timezone Validation
+Fixed offsets (e.g. `+05:30`, `-04:00`, `UTC+2`) do not account for daylight saving rules. The scheduler requires valid IANA timezone identifiers (e.g. `UTC`, `America/New_York`, `Asia/Kolkata`, `Europe/London`) verified against `ZoneId.getAvailableZoneIds()`. Fixed offsets are rejected with HTTP 400.
+
+#### Abuse Controls & Heuristic Interval Validation
+- **Minute Granularity**: The seconds field must be strictly `"0"` (or a macro like `@daily`). Sub-minute cron expressions (e.g. `*/10 * * * * *`) are rejected.
+- **Minimum Interval Heuristic**: Schedulers enforce a minimum interval (default: 60 seconds). A forward-looking heuristic calculates the next $N=5$ ticks; if any interval $\Delta t < 60\text{s}$, the schedule is rejected.
+- **Tenant Schedule Cap**: Tenants are restricted to a maximum of 20 active schedules (configurable via `scheduler.cron.max-schedules-per-tenant`).
+
+#### Daylight Saving Time (DST) Behavioral Specification
+Spring's `CronExpression` operates chronologically on `ZonedDateTime`:
+1. **Spring-Forward (e.g. America/New_York on March 8, 2026)**:
+   - At 02:00:00 EST, wall clocks jump directly to 03:00:00 EDT (hour 02:xx does not exist).
+   - If a schedule targets hour 2 (`0 30 2 * * *`), the non-existent hour is skipped on the transition day, and the next fire time advances to the next matching calendar day (`2026-03-09 02:30 EDT`). Schedules targeting hour 3 (`0 30 3 * * *`) fire normally on March 8 at 03:30 EDT.
+2. **Fall-Back (e.g. America/New_York on November 1, 2026)**:
+   - At 02:00:00 EDT, wall clocks turn back one hour to 01:00:00 EST (hour 01:xx repeats).
+   - A schedule set for `0 30 1 * * *` executes at the first occurrence (01:30 EDT, offset -04:00), then executes at the second occurrence (01:30 EST, offset -05:00), and then advances to November 2.
+
+---
+
+### 4.39 Poison Schedule Isolation, Auto-Disable Failure Tracking & Circuit Breaking
+
+#### Per-Schedule Transaction Isolation
+In a distributed poller claiming 25 schedules per batch, a single corrupted schedule (e.g. invalid template or unresolvable destination) must never roll back adjacent valid schedules. `CronScheduleProcessor` executes each schedule in an isolated transaction using `@Transactional(propagation = Propagation.REQUIRES_NEW)`.
+
+#### Auto-Disable Circuit Breaker
+When an unexpected exception occurs during schedule evaluation or job template validation:
+1. The engine catches the exception and increments `schedules.consecutive_failures`.
+2. The error message is persisted to `schedules.last_error`.
+3. If `consecutive_failures >= 5` (configurable via `scheduler.cron.max-consecutive-failures`), the schedule is **auto-disabled** (`enabled = false`) and an alert is logged.
+4. When a schedule succeeds, `consecutive_failures` is reset to 0 and `last_error` is cleared.
+
+---
+
+### 4.40 Partial Indexing for $O(1)$ Overlap Checks (`idx_jobs_schedule_active`) & EXPLAIN Benchmark
+
+#### The Overlap Query
+When a schedule has `overlap_policy = 'SKIP'`, the engine evaluates whether a previously spawned instance is still in flight:
+```sql
+SELECT count(*) FROM jobs 
+WHERE schedule_id = :id AND status IN ('PENDING', 'RUNNING');
+```
+
+On a high-volume system where historical jobs number in the millions, a sequential scan on `jobs` would destroy scheduler throughput.
+
+#### The Partial Index
+Flyway migration `V3__schedules_enhancement.sql` adds a partial index:
+```sql
+CREATE INDEX idx_jobs_schedule_active ON jobs (schedule_id)
+    WHERE status IN ('PENDING', 'RUNNING');
+```
+
+#### Measured Execution Plan (1,000 Historical Jobs)
+```text
+Aggregate  (cost=8.16..8.17 rows=1 width=8) (actual time=0.038..0.038 rows=1.00 loops=1)
+  Buffers: shared hit=2
+  ->  Index Only Scan using idx_jobs_schedule_active on jobs  (cost=0.14..8.16 rows=1 width=0) (actual time=0.033..0.035 rows=5.00 loops=1)
+        Index Cond: (schedule_id = '01a17d4e-c480-7e89-997d-8adee1cbdd58'::uuid)
+        Heap Fetches: 5
+        Index Searches: 1
+        Buffers: shared hit=2
+Planning Time: 0.121 ms
+Execution Time: 0.050 ms
+```
+
+- **Execution Time**: **0.050 ms** (~50 microseconds).
+- **Buffer Hits**: **shared hit=2** (PostgreSQL accesses exactly 2 8-KB memory buffer pages in the partial index; zero heap table scan).
+- **Write Efficiency**: Because the index predicate is `WHERE status IN ('PENDING', 'RUNNING')`, completed (`SUCCEEDED`) or dead-lettered (`DEAD`) jobs are instantly pruned from the index leaf pages, maintaining a microsecond-fast, compact index tree in RAM.
+
+---
+
 ## 5. What Went Wrong & Engineering Resolutions
 
 During environment setup, Flyway migrations, and Phase 2 implementation, several real-world engineering hurdles were encountered and resolved:
@@ -1108,6 +1274,26 @@ During environment setup, Flyway migrations, and Phase 2 implementation, several
  9. Spring Boot kebab-case mapping on        Configuration properties prefix mapping didn't
     worker properties.                       bind nested ssrf.allow-private-ips; renamed
                                              to ssrf-allow-private-ips in YAML.
+
+10. PostgreSQL partial index ON CONFLICT     PostgreSQL rejects ON CONFLICT (cols) if the
+    target specification mismatch.          underlying unique index has a WHERE clause.
+                                             Appended matching WHERE clause to ON CONFLICT.
+
+11. Concurrent Sweeper race condition        Sweeper claims claimed row via findById without
+    causing duplicate job spawns.            FOR UPDATE lock. Switched to findByIdForUpdate
+                                             with next_run_at <= now verification.
+
+12. Foreign key violation in performance     Seeding historical jobs failed on schedule_id_fkey
+    EXPLAIN benchmark tests.                 constraint. Inserted parent ScheduleEntity before
+                                             populating 1,000 historical job records.
+
+13. JSONB parser rejection on invalid       Testing poison template by injecting raw broken
+    syntax strings in PostgreSQL.            JSON string was rejected by PostgreSQL parser.
+                                             Injected valid JSON with invalid HTTP method.
+
+14. Spring CronExpression DST spring-        Clocks skip 02:00-02:59 in America/New_York on
+    forward skipped hour behavior.           March 8. Spring Cron advances to next day.
+                                             Documented & tested behavior boundaries.
 ```
 
 1. **Missing `javac` in Fedora Headless JRE**:
@@ -1145,6 +1331,26 @@ During environment setup, Flyway migrations, and Phase 2 implementation, several
    - *Symptom*: JPQL query `WHERE j.status IN (JobStatus.PENDING, JobStatus.RUNNING)` caused HQL validation and enum conversion errors.
    - *Cause*: Hibernate 6 requires typed collection parameter binding for enum arrays rather than unquoted inline literals.
    - *Resolution*: Refactored to Spring Data query method `countByUserIdAndStatusIn(UUID userId, Collection<JobStatus> statuses)` paired with an interface default method `countActiveJobsByUserId(UUID userId)`.
+10. **PostgreSQL Partial Index `ON CONFLICT` Target Specification Mismatch**:
+    - *Symptom*: Spawning a job with `ON CONFLICT (user_id, idempotency_key) DO NOTHING` failed with `ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification`.
+    - *Cause*: In PostgreSQL, if a unique index has a `WHERE` predicate (such as `idx_jobs_user_idempotency` defined on `(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL`), executing an `INSERT ... ON CONFLICT` statement without matching the predicate exactly causes PostgreSQL to reject the target specification.
+    - *Resolution*: Appended the exact predicate `WHERE idempotency_key IS NOT NULL` to the `ON CONFLICT` clause in `CronScheduleProcessor.java`, `ScheduleService.java`, and test harness SQL queries.
+11. **Concurrent Sweeper Duplicate Job Spawn Race Condition**:
+    - *Symptom*: In `testMultiInstanceConcurrencyExactlyOneJobPerSlot`, when two concurrent scheduler engines claimed the same schedule row via `claimDueSchedules()`, two separate jobs were spawned for the same tick instead of exactly one.
+    - *Cause*: While `claimDueSchedules()` claimed the schedule IDs using `SKIP LOCKED`, the subsequent `CronScheduleProcessor.processSchedule(scheduleId)` loaded the schedule via plain `findById(scheduleId)` without an exclusive lock (`FOR UPDATE`), and lacked a guard checking if `schedule.getNextRunAt().isAfter(now)`. The first thread committed the spawn and advanced `next_run_at`, but the second thread read the updated `next_run_at` and immediately scheduled the *next* tick!
+    - *Resolution*: Switched to `scheduleRepository.findByIdForUpdate(scheduleId)` to serialize processing per schedule and added an immediate temporal guard: `if (schedule.getNextRunAt().isAfter(now)) return;`.
+12. **Foreign Key Constraint Violation during EXPLAIN Benchmark Seeding**:
+    - *Symptom*: Populating 1,000 completed jobs in the test benchmark failed with `ERROR: insert or update on table "jobs" violates foreign key constraint "jobs_schedule_id_fkey"`.
+    - *Cause*: `V3__schedules_enhancement.sql` adds a strict foreign key `CONSTRAINT fk_jobs_schedule FOREIGN KEY (schedule_id) REFERENCES schedules(id) ON DELETE SET NULL`. Generating random UUIDs for `schedule_id` violates relational integrity.
+    - *Resolution*: Created and persisted a valid parent `ScheduleEntity` in PostgreSQL prior to bulk-inserting the 1,000 historical job rows.
+13. **PostgreSQL JSONB Syntax Validation on Poison Template Injection**:
+    - *Symptom*: Injecting a malformed JSON string (`'{"bad_json":'`) into `schedules.job_template` via SQL to simulate a poisoned database record failed with `ERROR: invalid input syntax for type json`.
+    - *Cause*: PostgreSQL validates JSON syntax on write for columns of type `JSONB`, rejecting malformed JSON tokens at the database level.
+    - *Resolution*: Injected syntactically valid JSON containing an invalid HTTP method (`'{"url":"https://example.com/api","method":"INVALID_METHOD"}'::jsonb`), which PostgreSQL stores, but `ScheduleValidator.validateJobTemplate(...)` safely catches and rejects at spawn time.
+14. **Spring `CronExpression` DST Spring-Forward Gap Behavior**:
+    - *Symptom*: A cron expression targeting `0 30 2 * * *` in `America/New_York` did not execute on March 8, 2026.
+    - *Cause*: On March 8, 2026 at 02:00:00, Eastern Standard Time (EST) jumps directly to 03:00:00 Eastern Daylight Time (EDT). The wall-clock hour `02:00:00` to `02:59:59` does not exist on that calendar date. Spring's `CronExpression.next()` mathematically skips the non-existent local hour and advances to the next valid match on March 9, 2026 at 02:30:00 EDT.
+    - *Resolution*: Validated and documented the exact DST boundary mechanics in `CronValidationAndDstTest`, confirming that crons targeting valid hours (e.g. `0 30 3 * * *`) fire normally on the DST transition date at 03:30:00 EDT.
 
 ---
 
@@ -1351,6 +1557,42 @@ frontend/.astro/
 > - *Read Benefit*: A partial index might reduce index buffer hits from 3 down to 2 — a sub-microsecond difference that is imperceptible in practice.
 > - *Write Amplification Penalty*: In PostgreSQL, every secondary index must be updated on `INSERT`, and on every `UPDATE` where indexed columns change (unless HOT update applies). Active jobs undergo frequent updates: worker lease claims (`status='RUNNING'`), lease heartbeats, and completion/failure transitions (`status='COMPLETED'` or `'DEAD'`). A partial index would require index leaf insertions and deletions on every lifecycle transition, increasing WAL generation and table bloat.
 > Reusing the composite index `idx_jobs_user_status (user_id, status, created_at DESC)` provides 35-microsecond read performance with zero additional write amplification."
+
+### Q22: Why must recurring cron blueprints be modeled separately from execution instances, and how does deterministic idempotency prevent double-spawns during scheduler recovery?
+**Interview Defense**:
+> "Schedulers that mutate a single record to represent both the recurrence rule (the cron spec) and the current execution state (the running job, its attempts, its HTTP logs, its worker lock) suffer irreversible state corruption. If a job fails or retries, overwriting `run_at` or `status` destroys the recurring schedule's cadence and metadata. Furthermore, concurrent executions or auditing previous run histories become impossible.
+> We use the **Blueprint vs. Instance Pattern**:
+> 1. A row in `schedules` acts as an immutable blueprint and cadence tracker (`cron_expression`, `timezone`, `job_template`, `next_run_at`, `consecutive_failures`).
+> 2. When a tick occurs, the engine spawns an independent row into the `jobs` table (`schedule_id`, `run_at`, `status = 'PENDING'`). This allows the execution engine to treat spawned jobs identically to one-off delayed jobs—benefiting from worker leases, heartbeat extensions, full-jitter exponential backoff, and dead-letter queues without polluting the recurring schedule.
+> 3. To prevent double spawns during scheduler crash-recovery or concurrent polling races, every spawned job receives a deterministic idempotency key derived from the schedule ID and the exact scheduled tick epoch: `cron:{scheduleId}:{scheduledTickEpoch}`.
+> Using `INSERT INTO jobs ... ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING` guarantees that even if a network partition or power failure causes the scheduler to replay a tick, at most one job instance can ever be inserted into PostgreSQL for that slot."
+
+### Q23: Why is enforcing a strict global lock hierarchy (`Schedule -> Tenant -> Job`) necessary to prevent deadlocks across concurrent pollers, manual triggers, and user submissions?
+**Interview Defense**:
+> "In a multi-tenant relational system with concurrent workflows (cron sweeper engines, manual trigger endpoints, and direct job submission APIs), transactions must acquire locks on multiple distinct entities: the schedule row, the tenant user row (for quota checks), and job rows. If Transaction A locks Tenant $\to$ Schedule while Transaction B locks Schedule $\to$ Tenant, PostgreSQL detects a cyclic wait-for dependency and terminates one of the transactions with a `40P01 deadlock_detected` error.
+> To eliminate deadlocks, we established and enforced a single system-wide locking hierarchy:
+> 1. **Primary Lock**: `Schedule` row (`SELECT ... FROM schedules WHERE id = :id FOR UPDATE`)
+> 2. **Secondary Lock**: `Tenant User` row (`SELECT ... FROM users WHERE id = :userId FOR UPDATE`)
+> 3. **Leaf Lock / Write**: `Job` row (`INSERT INTO jobs ...` or `SELECT ... FROM jobs FOR UPDATE`)
+> 
+> How every component strictly conforms to this ordering:
+> - **Cron Sweeper**: Claims candidate schedules with `FOR UPDATE SKIP LOCKED`, then enters `@Transactional(REQUIRES_NEW)` per schedule $\to$ acquires `Schedule FOR UPDATE` $\to$ acquires `Tenant FOR UPDATE` $\to$ inserts Job.
+> - **Manual Trigger (`POST /api/schedules/{id}/trigger`)**: Acquires `Schedule FOR UPDATE` $\to$ acquires `Tenant FOR UPDATE` $\to$ inserts Job.
+> - **Schedule Modification (`PATCH /api/schedules/{id}`)**: Acquires `Schedule FOR UPDATE`.
+> - **Direct Job Submission (`POST /api/jobs`)**: Acquires `Tenant FOR UPDATE` $\to$ inserts Job (schedules are never touched, preserving total ordering).
+> Because no code path ever acquires locks in reverse order, lock order inversion is impossible and deadlocks cannot occur."
+
+### Q24: How does our misfire handling (`FIRE_ONCE` vs `SKIP`) protect downstream systems from catastrophic thundering herds following scheduler downtime, and what happens during DST spring-forward / fall-back transitions?
+**Interview Defense**:
+> "Suppose a cron scheduler runs a job every 5 minutes (`0 */5 * * * *`). The scheduler suffers a 3-hour infrastructure outage (36 missed ticks). A naive scheduler that attempts to execute all 36 missed ticks upon restart will instantly flood both the local database and downstream webhook endpoints with a massive 36x thundering herd, overwhelming downstream rate limiters and knocking target APIs offline.
+> We mitigate this through explicit misfire policies anchored to PostgreSQL time:
+> - **`SKIP`**: Immediately discards all missed intervals, advances `next_run_at` to the first cron tick strictly after `now()`, and records `last_skip_reason = 'MISFIRE_SKIP'`.
+> - **`FIRE_ONCE` with Grace Window**: Checks if the elapsed downtime is within `grace_window_seconds`. If within grace, it executes exactly ONE catch-up job representing the most recent missed tick (using that tick's deterministic idempotency key `cron:{id}:{missedTickEpoch}`), and resets `next_run_at` to the first cron tick strictly after `now()`. If downtime exceeds the grace window, it treats the misfire as expired and skips entirely. In neither mode does it ever blast a queue with a backlog of dozens of missed runs.
+> 
+> **Daylight Saving Time (DST) Transitions with IANA Timezones**:
+> - **Spring-Forward (Gap)**: In `America/New_York` on the second Sunday of March, 01:59:59 jumps to 03:00:00 EDT. If a cron is configured for 02:30 (`0 30 2 * * *`), that local wall-clock hour does not exist. Spring's `CronExpression.next()` detects the non-existent time in the ZoneRules and advances to the next valid match on March 9. Crons targeting valid hours (e.g. 03:30) fire normally on March 8 at 03:30 EDT.
+> - **Fall-Back (Overlap)**: On the first Sunday of November, 01:59:59 EDT turns back to 01:00:00 EST. Hour 01:xx repeats. `CronExpression.next()` matches the first occurrence at 01:30 EDT (-04:00), then on subsequent evaluation matches the second occurrence at 01:30 EST (-05:00), ensuring both real-world hours fire without skipping or timezone corruption."
+
 
 
 

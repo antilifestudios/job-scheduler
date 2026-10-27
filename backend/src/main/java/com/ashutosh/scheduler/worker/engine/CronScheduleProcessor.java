@@ -1,5 +1,6 @@
 package com.ashutosh.scheduler.worker.engine;
 
+import com.ashutosh.scheduler.common.exception.ValidationException;
 import com.ashutosh.scheduler.common.util.CryptoUtils;
 import com.ashutosh.scheduler.common.util.UuidV7;
 import com.ashutosh.scheduler.domain.entity.ScheduleEntity;
@@ -16,13 +17,16 @@ import com.ashutosh.scheduler.producer.validator.ScheduleValidator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.support.CronExpression;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.interceptor.TransactionAspectSupport;
 import tools.jackson.databind.ObjectMapper;
 
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
@@ -68,8 +72,8 @@ public class CronScheduleProcessor {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void processSchedule(UUID scheduleId, Instant now) {
         // Enforce lock order: 1. Schedule row FOR UPDATE
-        ScheduleEntity schedule = scheduleRepository.findById(scheduleId).orElse(null);
-        if (schedule == null || !schedule.isEnabled()) {
+        ScheduleEntity schedule = scheduleRepository.findByIdForUpdate(scheduleId).orElse(null);
+        if (schedule == null || !schedule.isEnabled() || schedule.getNextRunAt().isAfter(now)) {
             return;
         }
 
@@ -78,6 +82,7 @@ public class CronScheduleProcessor {
         if (user == null) {
             log.warn("Schedule {} orphaned; user {} not found. Auto-disabling.", scheduleId, schedule.getUserId());
             schedule.setEnabled(false);
+            schedule.setDisabledReason("USER_NOT_FOUND");
             schedule.setLastError("Owning user not found.");
             scheduleRepository.save(schedule);
             return;
@@ -87,25 +92,39 @@ public class CronScheduleProcessor {
         CronExpression cron = CronExpression.parse(schedule.getCronExpression());
         ZonedDateTime nowZdt = now.atZone(zoneId);
         ZonedDateTime dueZdt = schedule.getNextRunAt().atZone(zoneId);
+        ZonedDateTime targetTickZdt = dueZdt;
 
         try {
-            long delaySeconds = Duration.between(schedule.getNextRunAt(), now).getSeconds();
-            boolean isMisfire = delaySeconds > schedule.getGraceWindowSeconds();
+            // Find the most recent missed tick before or at now
+            targetTickZdt = findLatestMissedTick(cron, dueZdt, nowZdt);
 
-            if (isMisfire) {
-                if (schedule.getMisfirePolicy() == MisfirePolicy.SKIP) {
-                    log.info("Schedule {} misfire skipped (delay={}s > grace={}s, policy=SKIP)",
-                        scheduleId, delaySeconds, schedule.getGraceWindowSeconds());
-                    schedule.setLastSkipReason(ScheduleSkipReason.MISFIRE_SKIP);
-                    schedule.setLastTickAt(now);
-                    advanceNextRunAt(schedule, cron, nowZdt);
-                    scheduleRepository.save(schedule);
-                    return;
-                }
+            // Measure lateness of the candidate tick being fired (now - most recent missed tick)
+            long latenessSeconds = Math.max(0, Duration.between(targetTickZdt.toInstant(), now).getSeconds());
+            boolean missedMultipleTicks = targetTickZdt.isAfter(dueZdt);
+            boolean latenessExceedsGrace = latenessSeconds > schedule.getGraceWindowSeconds();
+
+            // Misfire handling
+            if (schedule.getMisfirePolicy() == MisfirePolicy.SKIP && (missedMultipleTicks || latenessExceedsGrace)) {
+                log.info("Schedule {} misfire skipped (lateness={}s, missedMultiple={}, grace={}s, policy=SKIP)",
+                    scheduleId, latenessSeconds, missedMultipleTicks, schedule.getGraceWindowSeconds());
+                schedule.setLastSkipReason(ScheduleSkipReason.MISFIRE_SKIP);
+                schedule.setLastTickAt(now);
+                advanceNextRunAt(schedule, cron, nowZdt, targetTickZdt);
+                scheduleRepository.save(schedule);
+                return;
             }
 
-            // Target tick: for on-time or FIRE_ONCE catch-up, target the most recent tick before now
-            ZonedDateTime targetTickZdt = isMisfire ? findLatestMissedTick(cron, dueZdt, nowZdt) : dueZdt;
+            if (schedule.getMisfirePolicy() == MisfirePolicy.FIRE_ONCE && latenessExceedsGrace) {
+                log.info("Schedule {} misfire expired (lateness={}s > grace={}s, policy=FIRE_ONCE)",
+                    scheduleId, latenessSeconds, schedule.getGraceWindowSeconds());
+                schedule.setLastSkipReason(ScheduleSkipReason.MISFIRE_SKIP);
+                schedule.setLastTickAt(now);
+                advanceNextRunAt(schedule, cron, nowZdt, targetTickZdt);
+                scheduleRepository.save(schedule);
+                return;
+            }
+
+            // Target tick is valid and within grace window
             String idempotencyKey = "cron:" + scheduleId + ":" + targetTickZdt.toEpochSecond();
 
             // Check overlap policy
@@ -113,7 +132,7 @@ public class CronScheduleProcessor {
                 log.info("Schedule {} overlap skipped (active job exists, policy=SKIP)", scheduleId);
                 schedule.setLastSkipReason(ScheduleSkipReason.OVERLAP_SKIP);
                 schedule.setLastTickAt(now);
-                advanceNextRunAt(schedule, cron, nowZdt);
+                advanceNextRunAt(schedule, cron, nowZdt, targetTickZdt);
                 scheduleRepository.save(schedule);
                 return;
             }
@@ -125,7 +144,7 @@ public class CronScheduleProcessor {
                     scheduleId, activeJobs, user.getMaxActiveJobs());
                 schedule.setLastSkipReason(ScheduleSkipReason.QUOTA_SKIP);
                 schedule.setLastTickAt(now);
-                advanceNextRunAt(schedule, cron, nowZdt);
+                advanceNextRunAt(schedule, cron, nowZdt, targetTickZdt);
                 scheduleRepository.save(schedule);
                 return;
             }
@@ -143,13 +162,14 @@ public class CronScheduleProcessor {
             schedule.setLastSkipReason(null);
             schedule.setConsecutiveFailures(0);
             schedule.setLastError(null);
-            advanceNextRunAt(schedule, cron, nowZdt);
+            schedule.setDisabledReason(null);
+            advanceNextRunAt(schedule, cron, nowZdt, targetTickZdt);
             scheduleRepository.save(schedule);
 
             log.info("Schedule {} spawned job with key={}, nextRunAt={}", scheduleId, idempotencyKey, schedule.getNextRunAt());
 
         } catch (Exception e) {
-            handleFailure(schedule, cron, nowZdt, e);
+            handleFailure(schedule, cron, nowZdt, targetTickZdt, e);
         }
     }
 
@@ -171,7 +191,7 @@ public class CronScheduleProcessor {
             INSERT INTO jobs (id, user_id, schedule_id, queue, type, payload, body, status, priority,
                               run_at, attempts, max_attempts, idempotency_key, request_hash, created_at, updated_at)
             VALUES (?, ?, ?, ?, 'HTTP', ?::jsonb, ?, 'PENDING', ?, ?, 0, ?, ?, ?, ?, ?)
-            ON CONFLICT (user_id, idempotency_key) DO NOTHING
+            ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
             """;
 
         jdbcTemplate.update(insertSql,
@@ -181,9 +201,17 @@ public class CronScheduleProcessor {
         );
     }
 
-    private void advanceNextRunAt(ScheduleEntity schedule, CronExpression cron, ZonedDateTime nowZdt) {
+    private void advanceNextRunAt(ScheduleEntity schedule, CronExpression cron, ZonedDateTime nowZdt, ZonedDateTime targetTickZdt) {
         ZonedDateTime nextZdt = cron.next(nowZdt);
         if (nextZdt != null) {
+            // DST Fall-Back Guard: If the next tick matches targetTickZdt local time (the repeated hour in EDT -> EST),
+            // advance past the duplicate occurrence so the schedule fires strictly ONCE on that calendar day.
+            if (targetTickZdt != null && nextZdt.toLocalDateTime().isEqual(targetTickZdt.toLocalDateTime())) {
+                ZonedDateTime nextPass = cron.next(nextZdt);
+                if (nextPass != null) {
+                    nextZdt = nextPass;
+                }
+            }
             schedule.setNextRunAt(nextZdt.toInstant());
         }
     }
@@ -198,18 +226,48 @@ public class CronScheduleProcessor {
         return cursor;
     }
 
-    private void handleFailure(ScheduleEntity schedule, CronExpression cron, ZonedDateTime nowZdt, Exception e) {
-        int failures = schedule.getConsecutiveFailures() + 1;
-        schedule.setConsecutiveFailures(failures);
-        schedule.setLastError(e.getMessage());
-        log.error("Execution failure for schedule {}: {} (consecutive={})", schedule.getId(), e.getMessage(), failures);
+    public void handleFailure(ScheduleEntity schedule, CronExpression cron, ZonedDateTime nowZdt,
+                              ZonedDateTime targetTickZdt, Exception e) {
+        boolean isPermanent = (e instanceof ValidationException
+                || e instanceof tools.jackson.core.JacksonException
+                || e instanceof IllegalArgumentException);
 
-        if (failures >= maxConsecutiveFailures) {
+        String safeError = sanitizeErrorMessage(e);
+        schedule.setLastError(safeError);
+
+        if (isPermanent) {
             schedule.setEnabled(false);
-            log.error("Schedule {} auto-disabled after reaching {} consecutive failures", schedule.getId(), failures);
+            schedule.setDisabledReason("PERMANENT_VALIDATION_ERROR");
+            log.error("Schedule {} auto-disabled due to permanent error: {}", schedule.getId(), safeError, e);
+        } else {
+            int failures = schedule.getConsecutiveFailures() + 1;
+            schedule.setConsecutiveFailures(failures);
+            log.error("Execution failure for schedule {}: {} (consecutive={})", schedule.getId(), safeError, failures, e);
+
+            if (failures >= maxConsecutiveFailures) {
+                schedule.setEnabled(false);
+                schedule.setDisabledReason("MAX_CONSECUTIVE_FAILURES_EXCEEDED");
+                log.error("Schedule {} auto-disabled after reaching {} consecutive failures", schedule.getId(), failures);
+            }
         }
 
-        advanceNextRunAt(schedule, cron, nowZdt);
+        advanceNextRunAt(schedule, cron, nowZdt, targetTickZdt);
         scheduleRepository.save(schedule);
+    }
+
+    private String sanitizeErrorMessage(Throwable t) {
+        if (t == null) {
+            return "Unknown error occurred";
+        }
+        if (t instanceof ValidationException) {
+            return t.getMessage();
+        }
+        if (t instanceof tools.jackson.core.JacksonException) {
+            return "Malformed job template payload";
+        }
+        if (t instanceof DataAccessException || t instanceof SQLException) {
+            return "Database error during schedule execution";
+        }
+        return "Internal execution error during schedule processing";
     }
 }

@@ -65,6 +65,9 @@ public class ScheduleEntity {
     @Column(name = "last_error", columnDefinition = "text")
     private String lastError;
 
+    @Column(name = "disabled_reason")
+    private String disabledReason;
+
     @Column(nullable = false)
     private boolean enabled = true;
 
@@ -117,6 +120,9 @@ public class ScheduleEntity {
 
     public String getLastError() { return lastError; }
     public void setLastError(String lastError) { this.lastError = lastError; }
+
+    public String getDisabledReason() { return disabledReason; }
+    public void setDisabledReason(String disabledReason) { this.disabledReason = disabledReason; }
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }

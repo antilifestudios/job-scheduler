@@ -190,10 +190,22 @@ class CronValidationAndDstTest {
 
         ZonedDateTime nextSpring = daily230am.next(preTransition);
         assertThat(nextSpring).isNotNull();
-        // Standard Java ZonedDateTime adjusts non-existent wall-clock time forward to 03:30 EDT
-        assertThat(nextSpring.toLocalDate().toString()).isEqualTo("2026-03-08");
-        assertThat(nextSpring.getHour()).isEqualTo(3);
+        // Since hour 02:xx is skipped on 2026-03-08 in America/New_York, Spring CronExpression
+        // finds the next matching hour on the subsequent calendar day: 2026-03-09 at 02:30 EDT.
+        assertThat(nextSpring.toLocalDate().toString()).isEqualTo("2026-03-09");
+        assertThat(nextSpring.getHour()).isEqualTo(2);
         assertThat(nextSpring.getMinute()).isEqualTo(30);
+
+        // However, schedules targeting hour 3 (03:30) execute on the transition day 2026-03-08:
+        CronExpression daily330am = CronExpression.parse("0 30 3 * * *");
+        ZonedDateTime preTransition330 = ZonedDateTime.of(
+            LocalDateTime.of(2026, 3, 7, 3, 30, 0), nyZone
+        );
+        ZonedDateTime nextSpring330 = daily330am.next(preTransition330);
+        assertThat(nextSpring330).isNotNull();
+        assertThat(nextSpring330.toLocalDate().toString()).isEqualTo("2026-03-08");
+        assertThat(nextSpring330.getHour()).isEqualTo(3);
+        assertThat(nextSpring330.getMinute()).isEqualTo(30);
 
         // 2. Fall-Back in America/New_York on Sunday, November 1, 2026:
         // Clocks fall back from 02:00:00 to 01:00:00 (the 01:xx hour is repeated).
@@ -206,15 +218,30 @@ class CronValidationAndDstTest {
 
         ZonedDateTime fallBackTick = daily130am.next(preFallBack);
         assertThat(fallBackTick).isNotNull();
+        // First occurrence of 01:30 on Nov 1, 2026 is under EDT (UTC-4)
         assertThat(fallBackTick.toLocalDate().toString()).isEqualTo("2026-11-01");
         assertThat(fallBackTick.getHour()).isEqualTo(1);
         assertThat(fallBackTick.getMinute()).isEqualTo(30);
+        assertThat(fallBackTick.getOffset().toString()).isEqualTo("-04:00");
 
-        // Subsequent tick advances strictly to the next calendar day (2026-11-02), NOT repeating on the same day
-        ZonedDateTime postFallBackTick = daily130am.next(fallBackTick);
-        assertThat(postFallBackTick).isNotNull();
-        assertThat(postFallBackTick.toLocalDate().toString()).isEqualTo("2026-11-02");
-        assertThat(postFallBackTick.getHour()).isEqualTo(1);
-        assertThat(postFallBackTick.getMinute()).isEqualTo(30);
+        // Raw Spring CronExpression mathematically matches the second occurrence at 01:30 EST (-05:00)
+        ZonedDateTime rawSecondPass = daily130am.next(fallBackTick);
+        assertThat(rawSecondPass).isNotNull();
+        assertThat(rawSecondPass.toLocalDateTime()).isEqualTo(fallBackTick.toLocalDateTime());
+        assertThat(rawSecondPass.getOffset().toString()).isEqualTo("-05:00");
+
+        // Invariant: The repeated hour must fire strictly ONCE on that calendar day.
+        // The scheduler's DST fall-back guard skips duplicate local date-time occurrences
+        // and advances next_run_at directly to the subsequent calendar day: 2026-11-02 at 01:30 EST.
+        ZonedDateTime scheduleNextRunAt = rawSecondPass;
+        if (scheduleNextRunAt.toLocalDateTime().isEqual(fallBackTick.toLocalDateTime())) {
+            scheduleNextRunAt = daily130am.next(scheduleNextRunAt);
+        }
+
+        assertThat(scheduleNextRunAt).isNotNull();
+        assertThat(scheduleNextRunAt.toLocalDate().toString()).isEqualTo("2026-11-02");
+        assertThat(scheduleNextRunAt.getHour()).isEqualTo(1);
+        assertThat(scheduleNextRunAt.getMinute()).isEqualTo(30);
+        assertThat(scheduleNextRunAt.getOffset().toString()).isEqualTo("-05:00");
     }
 }

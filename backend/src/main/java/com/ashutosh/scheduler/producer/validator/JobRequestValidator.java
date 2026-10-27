@@ -61,12 +61,17 @@ public class JobRequestValidator {
             throw new ValidationException("Priority must be between 0 and 10 inclusive.");
         }
 
-        // 7. Max attempts validation (1-20)
+        // 7. Queue name validation (max 50 chars)
+        if (request.queue() != null && request.queue().length() > 50) {
+            throw new ValidationException("Queue name cannot exceed 50 characters.");
+        }
+
+        // 8. Max attempts validation (1-20)
         if (request.maxAttempts() != null && (request.maxAttempts() < 1 || request.maxAttempts() > 20)) {
             throw new ValidationException("Max attempts must be between 1 and 20.");
         }
 
-        // 8. Bounded runAt (at most 1 year in the future)
+        // 9. Bounded runAt (at most 1 year in the future)
         if (request.runAt() != null) {
             Instant maxAllowed = Instant.now().plus(MAX_FUTURE_SCHEDULE);
             if (request.runAt().isAfter(maxAllowed)) {

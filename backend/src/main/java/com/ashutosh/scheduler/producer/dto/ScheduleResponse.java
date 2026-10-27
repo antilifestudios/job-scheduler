@@ -23,6 +23,7 @@ public record ScheduleResponse(
     ScheduleSkipReason lastSkipReason,
     int consecutiveFailures,
     String lastError,
+    String disabledReason,
     boolean enabled,
     Instant createdAt,
     Instant updatedAt
@@ -43,6 +44,7 @@ public record ScheduleResponse(
             entity.getLastSkipReason(),
             entity.getConsecutiveFailures(),
             entity.getLastError(),
+            entity.getDisabledReason(),
             entity.isEnabled(),
             entity.getCreatedAt(),
             entity.getUpdatedAt()

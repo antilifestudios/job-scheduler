@@ -46,15 +46,7 @@ public class ScheduleValidator {
             throw new ValidationException("Schedule request body cannot be null.");
         }
 
-        // 1. Abuse control: Tenant active schedules cap
-        long currentCount = scheduleRepository.countByUserId(userId);
-        if (currentCount >= maxSchedulesPerTenant) {
-            throw new MaxSchedulesExceededException(
-                "Maximum active schedules limit (" + maxSchedulesPerTenant + ") reached for tenant."
-            );
-        }
-
-        // 2. Validate timezone
+        // 1. Validate timezone
         ZoneId zoneId = validateTimezone(request.timezone());
 
         // 3. Validate and normalize cron expression
@@ -191,5 +183,9 @@ public class ScheduleValidator {
             null
         );
         jobRequestValidator.validate(mockRequest, null);
+    }
+
+    public int getMaxSchedulesPerTenant() {
+        return maxSchedulesPerTenant;
     }
 }

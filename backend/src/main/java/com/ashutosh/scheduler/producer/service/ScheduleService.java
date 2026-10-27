@@ -1,6 +1,7 @@
 package com.ashutosh.scheduler.producer.service;
 
 import com.ashutosh.scheduler.common.exception.JobOverlapException;
+import com.ashutosh.scheduler.common.exception.MaxSchedulesExceededException;
 import com.ashutosh.scheduler.common.exception.QuotaExceededException;
 import com.ashutosh.scheduler.common.exception.ResourceNotFoundException;
 import com.ashutosh.scheduler.common.exception.ValidationException;
@@ -78,6 +79,21 @@ public class ScheduleService {
         ZonedDateTime firstRunZdt = cron.next(nowZdt);
         if (firstRunZdt == null) {
             throw new ValidationException("Cron expression has no future fire times.");
+        }
+
+        // 1. Lock the tenant row in the transaction to serialize concurrent schedule creations for this tenant
+        UserEntity user = userRepository.findByIdForUpdate(userId)
+            .orElseThrow(() -> new ResourceNotFoundException("User not found: " + userId));
+
+        // 2. Enforce schedule quota under the tenant row lock
+        long currentCount = scheduleRepository.countByUserId(userId);
+        int maxSchedules = scheduleValidator.getMaxSchedulesPerTenant();
+        if (currentCount >= maxSchedules) {
+            throw new MaxSchedulesExceededException(
+                "Active schedule quota of " + maxSchedules + " exceeded. Current schedules: " + currentCount + ".",
+                maxSchedules,
+                currentCount
+            );
         }
 
         String templateJson;
@@ -177,8 +193,11 @@ public class ScheduleService {
             boolean wasDisabled = !schedule.isEnabled();
             schedule.setEnabled(request.enabled());
             if (wasDisabled && request.enabled()) {
-                // Resume recalculates next_run_at strictly from now
+                // Resume recalculates next_run_at strictly from now and clears circuit-breaker state
                 cronOrTzChanged = true;
+                schedule.setDisabledReason(null);
+                schedule.setConsecutiveFailures(0);
+                schedule.setLastError(null);
             }
         }
 
@@ -276,7 +295,7 @@ public class ScheduleService {
             INSERT INTO jobs (id, user_id, schedule_id, queue, type, payload, body, status, priority,
                               run_at, attempts, max_attempts, idempotency_key, request_hash, created_at, updated_at)
             VALUES (?, ?, ?, ?, 'HTTP', ?::jsonb, ?, 'PENDING', ?, ?, 0, ?, ?, ?, ?, ?)
-            ON CONFLICT (user_id, idempotency_key) DO NOTHING
+            ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
             """;
 
         jdbcTemplate.update(insertSql,

@@ -113,13 +113,16 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(MaxSchedulesExceededException.class)
     public ResponseEntity<Map<String, Object>> handleMaxSchedulesExceeded(MaxSchedulesExceededException ex) {
+        // Aligned with job quota error contract (HTTP 429, code: quota_exceeded, strictly NO rate-limit headers)
         Map<String, Object> body = Map.of(
             "timestamp", Instant.now().toString(),
-            "status", HttpStatus.BAD_REQUEST.value(),
-            "code", "max_schedules_exceeded",
-            "message", ex.getMessage()
+            "status", HttpStatus.TOO_MANY_REQUESTS.value(),
+            "code", "quota_exceeded",
+            "message", ex.getMessage(),
+            "maxSchedules", ex.getMaxSchedules(),
+            "currentSchedules", ex.getCurrentSchedules()
         );
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
     }
 
     @ExceptionHandler(Exception.class)

@@ -20,6 +20,10 @@ public interface ScheduleRepository extends JpaRepository<ScheduleEntity, UUID> 
     Optional<ScheduleEntity> findByIdAndUserId(UUID id, UUID userId);
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT s FROM ScheduleEntity s WHERE s.id = :id")
+    Optional<ScheduleEntity> findByIdForUpdate(@Param("id") UUID id);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT s FROM ScheduleEntity s WHERE s.id = :id AND s.userId = :userId")
     Optional<ScheduleEntity> findByIdAndUserIdForUpdate(@Param("id") UUID id, @Param("userId") UUID userId);
 
