@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "skills": {
+    "review-security": {
+      "source": "mgiovani/cc-arsenal",
+      "sourceType": "github",
+      "skillPath": "skills/review-security/SKILL.md",
+      "computedHash": "260649246bccdfd21cb20211585af54b48b8a02fb143ea4641d5f59daaabe191"
+    },
+    "security-compliance-review": {
+      "source": "cess15/skills",
+      "sourceType": "github",
+      "skillPath": "skills/security-compliance-review/SKILL.md",
+      "computedHash": "107fb4f5c38c58c84157bbd7b75a14bf557e2cb6405aec957caab54fcb683639"
+    },
+    "supabase-postgres-best-practices": {
+      "source": "supabase/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/supabase-postgres-best-practices/SKILL.md",
+      "computedHash": "e14e276241805c97dbcfe40dcbea1a3035269cc7293cac4b1832dda41a835e60"
+    },
+    "tailwind-4-docs": {
+      "source": "lombiq/tailwind-agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/tailwind-4-docs/SKILL.md",
+      "computedHash": "de756f5f03cc20a029983875b00b9dfef9d0ba8567d242c5cbb0262037d0a134"
+    }
+  }
+}

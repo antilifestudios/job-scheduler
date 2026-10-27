@@ -1,0 +1,831 @@
+# Reliable HTTP Job Scheduler — Architecture & Technical Design Document
+
+> **Document Version:** 1.3.0 (Phase 4 Retries, Backoff, DLQ, Heartbeat & Lease Reaper)  
+> **Status:** Active / Under Iterative Development  
+> **Target Audience:** Engineering Mentors, Backend System Designers, Technical Interviewers  
+
+---
+
+## Table of Contents
+1. [Mission & Problem Statement](#1-mission--problem-statement)
+2. [Core Concept Definitions ("What Everything Is")](#2-core-concept-definitions-what-everything-is)
+3. [System Architecture & Visual Diagrams](#3-system-architecture--visual-diagrams)
+   - [3.1 High-Level Topology & Port Isolation](#31-high-level-topology--port-isolation)
+   - [3.2 State Machine & Job Lifecycle](#32-state-machine--job-lifecycle)
+   - [3.3 Atomic Claim & Concurrency Protocol](#33-atomic-claim--concurrency-protocol)
+   - [3.4 Worker Execution & Off-Transaction Model](#34-worker-execution--off-transaction-model)
+   - [3.5 Lease Expiry, Heartbeat & Reaper Protocol](#35-lease-expiry-heartbeat--reaper-protocol)
+4. [Deep-Dive Architecture Choices & Trade-Offs](#4-deep-dive-architecture-choices--trade-offs)
+   - [4.1 Primary Key Selection: UUIDv7 vs UUIDv4](#41-primary-key-selection-uuidv7-vs-uuidv4)
+   - [4.2 Payload Config (JSONB) vs Verbatim Body (TEXT)](#42-payload-config-jsonb-vs-verbatim-body-text)
+   - [4.3 Database Type Safety: VARCHAR + CHECK vs Native ENUM](#43-database-type-safety-varchar--check-vs-native-enum)
+   - [4.4 Indexing Strategy: Partial Indexes vs Full Composite B-Trees](#44-indexing-strategy-partial-indexes-vs-full-composite-b-trees)
+   - [4.5 Single Clock Authority (`now()` in SQL vs Application Clocks)](#45-single-clock-authority-now-in-sql-vs-application-clocks)
+   - [4.6 Database Bloat & Autovacuum Plan (HOT Updates & fillfactor = 70)](#46-database-bloat--autovacuum-plan-hot-updates--fillfactor--70)
+   - [4.7 Rootless Podman on Fedora (SELinux :Z & Systemd Auto-Restart)](#47-rootless-podman-on-fedora-selinux-z--systemd-auto-restart)
+   - [4.8 API Authentication & API Key Strategy](#48-api-authentication--api-key-strategy)
+   - [4.9 Idempotency Implementation: In-Transaction DB Row vs Redis](#49-idempotency-implementation-in-transaction-db-row-vs-redis)
+   - [4.10 Request Body Format & Binary Limitation](#410-request-body-format--binary-limitation)
+   - [4.11 Input Validation & SSRF Disclaimer](#411-input-validation--ssrf-disclaimer)
+   - [4.12 Sensitive Data Logging Policy](#412-sensitive-data-logging-policy)
+   - [4.13 Worker Threading Model: Platform Thread Pool vs Java 21 Virtual Threads + Semaphore](#413-worker-threading-model-platform-thread-pool-vs-java-21-virtual-threads--semaphore)
+   - [4.14 Atomic Claim Query & Plan Verification](#414-atomic-claim-query--plan-verification)
+   - [4.15 Off-Transaction Handler Execution & Hikari Pool Sizing](#415-off-transaction-handler-execution--hikari-pool-sizing)
+   - [4.16 Fencing Token Guard Against Zombie Workers](#416-fencing-token-guard-against-zombie-workers)
+   - [4.17 Handler Contract & Extensibility](#417-handler-contract--extensibility)
+   - [4.18 Exponential Backoff with Full Jitter Formula & Math](#418-exponential-backoff-with-full-jitter-formula--math)
+   - [4.19 Dead-Letter Queue (DLQ) & Terminal Failure Semantics](#419-dead-letter-queue-dlq--terminal-failure-semantics)
+   - [4.20 Lease Reaper Architecture & Multi-Instance Skip-Locked Sweeper](#420-lease-reaper-architecture--multi-instance-skip-locked-sweeper)
+   - [4.21 Heartbeat Protocol & AutoCloseable Resource Management](#421-heartbeat-protocol--autocloseable-resource-management)
+   - [4.22 Graceful Shutdown Protocol](#422-graceful-shutdown-protocol)
+5. [What Went Wrong & Engineering Resolutions](#5-what-went-wrong--engineering-resolutions)
+6. [Repository Exclusion Policy (.gitignore)](#6-repository-exclusion-policy-gitignore)
+7. [Comprehensive Interview Defense & Technical Questions](#7-comprehensive-interview-defense--technical-questions)
+
+---
+
+## 1. Mission & Problem Statement
+
+### The Problem
+Modern web backends regularly need to invoke external HTTP endpoints asynchronously:
+- *"Send this webhook in 10 minutes."*
+- *"Sync customer data with external CRM every morning at 03:00 UTC."*
+- *"Dispatch this notification to an external gateway, retry with backoff if their server is down, and tell me what happened."*
+
+Traditional solutions usually involve managed services (e.g., Upstash QStash, AWS EventBridge Scheduler, Google Cloud Tasks) or heavyweight distributed infrastructure (Kafka + Debezium, RabbitMQ, Celery, Redis BullMQ). For small-to-medium systems, standalone SaaS sites, or developer laptops, operating a Kafka cluster or paying per-request SaaS pricing introduces unnecessary operational complexity, unpredictable cloud bills, or network dependencies.
+
+### What We Are Achieving
+We are building a **self-hosted, production-grade, PostgreSQL-backed reliable HTTP job scheduler** paired with a live monitoring dashboard. It allows clients to submit HTTP requests (method, target URL, headers, and body) to run either:
+1. **Immediately / Delayed**: Executed after a specified delay (`run_at`).
+2. **Recurring**: Executed on a standard cron expression.
+
+When requests fail due to downstream timeouts, 5xx server errors, or network hiccups, the engine retries them using exponential backoff with full jitter. Jobs exceeding maximum retry attempts land in a **Dead Letter Queue (DLQ)**, where they are preserved with full diagnostic history and can be inspected or replayed.
+
+### Honest Scope & Anti-Goals
+- **This is NOT Kafka-scale**: We do not claim 500,000 writes/second or infinite log streaming. Claiming Kafka-scale on top of relational RDBMS queues is an interview anti-pattern.
+- **This IS a resilient, at-least-once, lease-governed relational queue**: Designed to process tens of thousands of jobs per hour with zero message loss, zero external broker dependencies, ACID transactional integrity, and strong concurrency guarantees using native PostgreSQL row locks (`SKIP LOCKED`).
+
+---
+
+## 2. Core Concept Definitions ("What Everything Is")
+
+To defend this architecture in an interview, every term must be understood down to its engine-level mechanics:
+
+| Concept                          | Technical Definition                                                                                                                                       | Why It Exists in Our System                                                                                                                                                                                              |
+| :------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Job**                          | A single persistent unit of work representing an outbound HTTP call, including metadata, execution schedule, current status, and retry state.              | The primary entity tracked in the `jobs` table.                                                                                                                                                                          |
+| **At-Least-Once Delivery**       | A guarantee that every scheduled job will be executed at least one time, but in rare network or crash scenarios might be executed more than once.          | Network partitions or worker crashes during HTTP completion can cause leases to expire before the worker updates status. Handlers must therefore be idempotent.                                                          |
+| **Idempotency Key**              | A unique per-user client token submitted during job creation.                                                                                              | Enforced by a partial unique index `(user_id, idempotency_key)`. If a network glitch causes a client to submit the same POST twice, the engine returns the existing job with `200 OK` rather than duplicating execution. |
+| **Worker Lease**                 | A time-limited lock (`locked_by`, `locked_until`) acquired by a worker when claiming a job.                                                                | Prevents other workers from executing the same job concurrently while allowing automatic reclamation if the assigned worker crashes.                                                                                     |
+| **Heartbeat**                    | A background worker thread that periodically extends `locked_until = now() + INTERVAL` for long-running HTTP requests.                                     | Ensures long jobs don't get prematurely reclaimed by the reaper while the worker is actively waiting for a slow downstream server.                                                                                       |
+| **Lease Reaper**                 | A scheduled background sweeper that detects orphaned jobs whose `locked_until < now()` and requeues or fails them.                                         | Recovers from hard worker crashes (e.g., node power failure, OS kernel panic, or OOM kill) without human intervention.                                                                                                   |
+| **Fencing Token / Lease Guard**  | Guarding completion writes by `WHERE id = :id AND locked_by = :workerId AND status = 'RUNNING'`.                                                           | Solves the "zombie worker" problem: if a worker experiences a 60-second GC pause and its lease was reassigned, its stale write fails safely (0 rows affected).                                                           |
+| **Dead Letter Queue (DLQ)**      | A terminal state (`status = 'DEAD'`) for jobs that have exhausted all retry attempts without succeeding.                                                   | Prevents failed jobs ("poison pills") from perpetually clogging queue throughput while preserving the failure snippet for debugging and manual replay.                                                                   |
+| **Exponential Backoff + Jitter** | Retry delay formula: $\text{delay} = \min(\text{cap}, \text{base} \cdot 2^{\text{attempt}}) \pm \text{random_jitter}$.                                     | Prevents the "thundering herd" problem where hundreds of retrying jobs hammer an already struggling downstream API simultaneously.                                                                                       |
+| **HOT (Heap-Only Tuple) Update** | A PostgreSQL optimization where an updated row version is placed on the exact same 8 KB data page as the old version without modifying any index pointers. | Drastically reduces table and index write amplification on update-heavy queue rows. Enabled by setting `fillfactor = 70`.                                                                                                |
+
+---
+
+## 3. System Architecture & Visual Diagrams
+
+### 3.1 High-Level Topology & Port Isolation
+
+Public internet access is strictly limited to the Producer REST API behind Cloudflare Tunnel. Actuator and internal management endpoints live on a physically distinct port that is never forwarded.
+
+```mermaid
+flowchart TD
+    subgraph Public_Internet["Public Internet"]
+        Client["Client / User / Web App"]
+    end
+
+    subgraph Tunnel["Cloudflare Tunnel (cloudflared)"]
+        CF["Cloudflare Edge"]
+    end
+
+    subgraph Host_Machine["Fedora Host (Developer Laptop)"]
+        subgraph Port_8080["Public Application Boundary (Port 8080)"]
+            API["Spring Boot Producer API<br/>(/api/v1/jobs)"]
+            Auth["API Key Auth & Tenant Rate Limiter"]
+        end
+
+        subgraph Port_8081["Internal Management Boundary (Port 8081)"]
+            Actuator["Spring Boot Actuator<br/>(/actuator/health, /actuator/prometheus)"]
+            Prometheus["Prometheus Scraper (Internal)"]
+            Healthcheck["Container Healthcheck Probe"]
+        end
+
+        subgraph Engine["Scheduler Core Services"]
+            Worker["Worker Pool (Poller & Execution Engine)"]
+            Reaper["Lease Reaper Engine"]
+            SSRF["SSRF-Hardened HTTP Client"]
+        end
+
+        subgraph Postgres_Container["PostgreSQL 16 Alpine (Rootless Podman)"]
+            Tables[("jobs (fillfactor=70)<br/>job_attempts<br/>schedules<br/>users")]
+            Indexes["Partial Indexes:<br/>idx_jobs_claim<br/>idx_jobs_reaper"]
+        end
+    end
+
+    subgraph External_Web["Target Endpoints"]
+        TargetAPI["Downstream HTTP APIs<br/>(Webhooks, Microservices)"]
+    end
+
+    Client -->|HTTPS Request| CF
+    CF -->|Tunnel Ingress ONLY to :8080| Auth
+    Auth --> API
+    API -->|Insert Job PENDING| Tables
+
+    Healthcheck -->|HTTP Probe| Actuator
+    Prometheus -->|Scrape Metrics| Actuator
+
+    Worker -->|Claim with SKIP LOCKED| Tables
+    Worker -->|Execute HTTP Call| SSRF
+    SSRF -->|Validated Egress Only| TargetAPI
+    Worker -->|Fenced Result Write| Tables
+    Reaper -->|Sweep Expired Leases| Tables
+```
+
+---
+
+### 3.2 State Machine & Job Lifecycle
+
+A job moves through an explicit state machine with strict database constraints:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: Ingestion (run_at <= now() or scheduled future)
+    
+    PENDING --> RUNNING: Atomic Claim (UPDATE ... FOR UPDATE SKIP LOCKED)
+    
+    RUNNING --> SUCCEEDED: 2xx Success (Fenced write)
+    
+    RUNNING --> PENDING: Retryable Failure & attempts < max_attempts<br/>(run_at = now() + FullJitterBackoff)
+    RUNNING --> DEAD: Retryable Failure & attempts >= max_attempts<br/>OR Permanent Failure (Fenced write to DLQ)
+    
+    RUNNING --> PENDING: Lease Expired & attempts < max_attempts (Reaper Sweeper)
+    RUNNING --> DEAD: Lease Expired & attempts >= max_attempts (Reaper Sweeper)
+    
+    RUNNING --> RUNNING: Heartbeat Extension (locked_until = now() + leaseDuration)
+    
+    DEAD --> PENDING: Manual User Replay (/api/jobs/{id}/replay)
+    
+    SUCCEEDED --> [*]
+    DEAD --> [*]
+```
+
+---
+
+### 3.3 Atomic Claim & Concurrency Protocol
+
+Multiple worker threads and multiple application instances poll concurrently without locking each other or double-claiming rows.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W1 as Worker 1
+    participant W2 as Worker 2
+    participant DB as PostgreSQL (jobs table)
+    participant Ext as Target HTTP API
+
+    Note over W1,W2: Both workers initiate claim cycle simultaneously
+    W1->>DB: UPDATE jobs SET status='RUNNING', locked_by='worker-1', locked_until=now()+'30s'<br/>WHERE id IN (SELECT id FROM jobs WHERE status='PENDING' AND run_at <= now()<br/>ORDER BY priority DESC, run_at ASC LIMIT 5 FOR UPDATE SKIP LOCKED) RETURNING *
+    W2->>DB: UPDATE jobs SET status='RUNNING', locked_by='worker-2', locked_until=now()+'30s'<br/>WHERE id IN (SELECT id FROM jobs WHERE status='PENDING' AND run_at <= now()<br/>ORDER BY priority DESC, run_at ASC LIMIT 5 FOR UPDATE SKIP LOCKED) RETURNING *
+
+    Note over DB: SKIP LOCKED: W1 locks rows [A, B].<br/>W2 immediately skips [A, B] without blocking and locks rows [C, D].
+    DB-->>W1: Returns claimed rows [A, B]
+    DB-->>W2: Returns claimed rows [C, D]
+
+    par Worker 1 Execution
+        W1->>Ext: Dispatch HTTP Call for Row A
+        Ext-->>W1: 200 OK
+        W1->>DB: UPDATE jobs SET status='SUCCEEDED'<br/>WHERE id='A' AND locked_by='worker-1' AND status='RUNNING'
+    and Worker 2 Execution
+        W2->>Ext: Dispatch HTTP Call for Row C
+        Ext-->>W2: 504 Gateway Timeout
+        W2->>DB: UPDATE jobs SET status='FAILED', attempts=attempts+1, run_at=now()+'backoff'<br/>WHERE id='C' AND locked_by='worker-2' AND status='RUNNING'
+    end
+```
+
+---
+
+### 3.4 Lease Expiry, Heartbeat & Reaper Protocol
+
+This diagram illustrates how heartbeats protect long jobs while the reaper reclaims abandoned jobs from crashed workers without race conditions.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as Worker 1
+    participant HB as Heartbeat Thread
+    participant R as Lease Reaper
+    participant DB as PostgreSQL
+
+    W->>DB: Claim Job (locked_until = now() + 30s)
+    W->>W: Processing long HTTP call...
+
+    rect rgb(240, 248, 255)
+    Note over W,HB: Active Heartbeat Loop (Every 10s)
+    HB->>DB: UPDATE jobs SET locked_until = now() + 30s<br/>WHERE id = :jobId AND locked_by = 'worker-1' AND status = 'RUNNING'
+    end
+
+    Note over W: Worker 1 suffers hard crash / OOM kill!
+    Note over HB: Heartbeat dies with Worker 1.
+
+    Note over DB: 30 seconds elapse. locked_until is now in the past (< now()).
+
+    R->>DB: SELECT id, attempts, max_attempts FROM jobs<br/>WHERE status = 'RUNNING' AND locked_until < now() FOR UPDATE SKIP LOCKED
+    DB-->>R: Returns crashed Job ID
+
+    alt attempts < max_attempts
+        R->>DB: UPDATE jobs SET status = 'PENDING', attempts = attempts + 1,<br/>locked_by = NULL, locked_until = NULL, run_at = now()<br/>WHERE id = :jobId
+        Note over DB: Job is back in PENDING queue for another worker
+    else attempts >= max_attempts
+        R->>DB: UPDATE jobs SET status = 'DEAD', last_error = 'Lease expired without completion'<br/>WHERE id = :jobId
+    end
+```
+
+---
+
+## 4. Deep-Dive Architecture Choices & Trade-Offs
+
+### 4.1 Primary Key Selection: UUIDv7 vs UUIDv4
+*(Defended purely on database index B-Tree physical layout and buffer cache mechanics.)*
+
+- **The Flaw of UUIDv4**:
+  UUIDv4 generates 128 pseudo-random bits. A B-Tree index maintains keys in sorted order. When inserting random UUIDv4 keys into a table with millions of rows, each new key lands in an arbitrary leaf page scattered throughout the B-Tree.
+  - As soon as the index exceeds PostgreSQL's `shared_buffers` cache, each insert causes a random read from disk to pull the target page into RAM, followed by a dirty write back to disk.
+  - When a target leaf page is full, PostgreSQL must perform a **50/50 page split**: it allocates a new 8 KB block, moves half the tuples to the new block, and updates parent nodes. This causes high write amplification and leaves index pages with an average fill factor of ~50%, doubling physical storage.
+- **The Efficiency of UUIDv7 (RFC 9562)**:
+  UUIDv7 begins with a 48-bit big-endian millisecond timestamp, followed by version bits and 74 random bits.
+  - Because timestamp values strictly increase over time, successive keys are monotonically ordered.
+  - Every `INSERT` targets the **right-most leaf page** of the B-Tree index (right-edge append).
+  - Leaf pages fill to near 100% capacity before a clean right-edge split allocates the next page.
+  - Only the newest leaf page needs to stay resident in cache, yielding near 100% cache hit ratios and identical insertion performance to an auto-incrementing `BIGINT`, while preserving global uniqueness.
+
+---
+
+### 4.2 Payload Config (JSONB) vs Verbatim Body (TEXT)
+
+- **`payload JSONB`**:
+  Contains configuration parameters that our scheduling engine must interpret:
+  ```json
+  {
+    "url": "https://api.example.com/v1/webhooks",
+    "method": "POST",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-Custom-Header": "production-event"
+    },
+    "timeout_ms": 5000
+  }
+  ```
+- **`body TEXT`**:
+  Stores the exact HTTP request body verbatim.
+- **Why NOT round-trip the body through JSONB?**
+  1. **Canonicalization alters byte signatures**: `JSONB` parses JSON into an internal binary tree. It reorders keys alphabetically, strips extraneous whitespace, collapses multi-line formatting, and drops duplicate object keys. If the downstream API verifies an HMAC signature (e.g., Stripe, GitHub, or Shopify webhook verification) computed over raw bytes, JSONB round-tripping breaks signature verification.
+  2. **Non-JSON compatibility**: Jobs can deliver raw text, XML documents, CSV files, GraphQL queries, SOAP envelopes, or form-urlencoded strings. Storing `body TEXT` accepts any payload format without rejection.
+
+---
+
+### 4.3 Database Type Safety: VARCHAR + CHECK vs Native ENUM
+
+- **The Problem with Postgres `CREATE TYPE job_status AS ENUM (...)`**:
+  - In PostgreSQL, altering a native enum type (adding values inside transactions, reordering, or deprecating values) historically required schema-level exclusive catalog locks (`pg_type`).
+  - Native enums create tight coupling with ORM frameworks (Hibernate/JPA often requires proprietary PostgreSQL dialect mappings).
+  - Rolling back migrations involving enum alterations is notoriously difficult in Flyway.
+- **The Solution: `VARCHAR(20) CHECK (status IN (...))`**:
+  - 100% database-enforced integrity (invalid strings are rejected immediately with a constraint violation).
+  - Adding a new status in a future migration is a non-blocking `ALTER TABLE jobs DROP CONSTRAINT ...` and `ALTER TABLE jobs ADD CONSTRAINT ... NOT VALID` followed by `VALIDATE CONSTRAINT`.
+  - Maps transparently to Java `@Enumerated(EnumType.STRING)` without custom type binders.
+
+---
+
+### 4.4 Indexing Strategy: Partial Indexes vs Full Composite B-Trees
+
+A typical job queue follows an extreme lifecycle:
+$$\text{Pending (short)} \longrightarrow \text{Running (seconds)} \longrightarrow \text{Succeeded / Dead (permanent)}$$
+Over weeks of operation, a table might hold 5,000,000 total rows, of which only 150 are `PENDING` and 10 are `RUNNING`.
+
+- **Anti-Pattern (Full Index)**:
+  `CREATE INDEX idx_jobs ON jobs (status, priority, run_at);`
+  - Maintains pointers to all 5,000,000 completed rows.
+  - The index swells to hundreds of megabytes, forcing disk I/O on every worker claim poll.
+- **Our Pattern (Partial Indexes)**:
+  ```sql
+  -- Claim Index: Only indexes active work candidates
+  CREATE INDEX idx_jobs_claim ON jobs (priority DESC, run_at ASC)
+      WHERE status = 'PENDING';
+
+  -- Reaper Index: Only indexes active leases
+  CREATE INDEX idx_jobs_reaper ON jobs (locked_until ASC)
+      WHERE status = 'RUNNING';
+  ```
+  - As soon as a row changes to `RUNNING` or `SUCCEEDED`, PostgreSQL automatically prunes it from `idx_jobs_claim`.
+  - The index remains a few kilobytes in size, fitting permanently into CPU L2/L3 cache or `shared_buffers`.
+
+---
+
+### 4.5 Single Clock Authority (`now()` in SQL vs Application Clocks)
+
+In a distributed deployment with multiple worker containers across laptops or servers, local system clocks can drift due to NTP skew, hardware variance, or VM virtualization pauses.
+- If Worker A has a clock skewed +5 seconds ahead of Worker B, Worker A might claim a lease or determine a job is due before Worker B.
+- **Design Rule**: All temporal evaluation (`run_at <= now()`, `locked_until = now() + INTERVAL '30 seconds'`, `locked_until < now()`) is strictly computed inside PostgreSQL using `now()`. Worker JVMs never pass client timestamps into query WHERE clauses for scheduling logic.
+
+---
+
+### 4.6 Database Bloat & Autovacuum Plan (HOT Updates & fillfactor = 70)
+
+Because PostgreSQL uses Multiversion Concurrency Control (MVCC), an `UPDATE` does not overwrite data in place; it writes a new version of the row (tuple) and marks the old version as dead. A queue table where rows transition `PENDING` $\to$ `RUNNING` $\to$ `HEARTBEAT` $\to$ `SUCCEEDED` will accumulate dead tuples at 3x to 5x the rate of insertions.
+
+#### HOT (Heap-Only Tuple) Optimization
+- If an update does not change any indexed column, and the data page has enough spare capacity, Postgres places the new tuple on the same 8 KB page and creates a page-internal pointer chain.
+- No index update is incurred, and normal reads prune dead tuple versions on the fly.
+- By default, tables have `fillfactor = 100` (packed full on insert). In [V1__initial_schema.sql](file:///home/ashutosh/Desktop/job-scheduler/backend/src/main/resources/db/migration/V1__initial_schema.sql), we configure:
+  ```sql
+  ALTER TABLE jobs SET (
+      fillfactor = 70,                        -- Reserves 30% page space for in-place HOT updates
+      autovacuum_vacuum_scale_factor = 0.02,  -- Trigger vacuum after 2% row churn (vs default 20%)
+      autovacuum_vacuum_threshold = 100,      -- Or at least 100 dead rows
+      autovacuum_vacuum_cost_limit = 1000,    -- 5x higher I/O budget for vacuum sweeps
+      autovacuum_vacuum_cost_delay = 2        -- Fast 2ms throttle delay
+  );
+  ```
+
+---
+
+### 4.7 Rootless Podman on Fedora (SELinux :Z & Systemd Auto-Restart)
+
+#### The SELinux `:Z` Requirement
+On Fedora, rootless containers execute inside the SELinux `container_t` domain. Host filesystem directories (like `./postgres_data`) are labeled `user_home_t`.
+- When PostgreSQL attempts to initialize the database in a standard bind-mount, SELinux blocks container process writes with `Permission Denied`.
+- Appending the `:Z` flag (`./postgres_data:/var/lib/postgresql/data:Z`) instructs Podman to automatically relabel the directory with a private unshared container context (`system_u:object_r:container_file_t:s0:c...`), allowing PostgreSQL full read/write access.
+
+#### Auto-Restarting Across Reboots on Fedora
+Rootless containers belong to user systemd sessions (`/run/user/$UID`), which do not start at system boot unless configured:
+1. **Enable Systemd Lingering**:
+   ```bash
+   loginctl enable-linger $USER
+   ```
+   Ensures the systemd user manager starts at system boot and remains running even when no interactive terminal session is active.
+2. **Enable Podman Restart Service**:
+   ```bash
+   systemctl --user enable --now podman-restart.service
+   ```
+   This service queries Podman's state database on system boot and restarts all containers marked with `restart: unless-stopped`.
+
+---
+
+### 4.8 Dedicated API Keys Architecture & Rotation
+Instead of storing a single static key hash on the `users` table, Phase 2 implements a separate `api_keys` relation (`api_keys(id, user_id, key_hash, key_prefix, created_at, revoked_at, last_used_at)`):
+- **High Entropy Generation**: Keys are generated using `SecureRandom` with 32 bytes (256 bits) of cryptographic entropy, encoded via URL-safe Base64 (`sk_live_...`).
+- **No Keys in Migrations**: Migrations define the schema only. Initial development keys are provisioned via a non-production `DevBootstrapRunner` (`@Profile("!test")`), which logs the issued secret key exactly once on startup.
+- **Hash Storage & Lookups**: Only the SHA-256 hex digest (`key_hash`) is persisted. The `key_prefix` (e.g. `sk_live_a1b2c3d4`) is stored in plaintext solely for user identification in management UIs.
+- **Revocation**: Key revocation is supported via `revoked_at TIMESTAMPTZ`. A partial index on `key_hash WHERE revoked_at IS NULL` guarantees lookups ignore revoked credentials.
+
+---
+
+### 4.9 Atomic Idempotency Protocol with Request Hashing
+When clients submit requests with an `idempotency_key` (via the `Idempotency-Key` HTTP header or JSON field `idempotencyKey`):
+1. **Header vs JSON Agreement**: If both the header and JSON body specify an idempotency key and they disagree, the request is immediately rejected with `400 Bad Request`.
+2. **Atomic Conflict Insertion**:
+   ```sql
+   INSERT INTO jobs (
+       id, user_id, queue, type, payload, body, status,
+       priority, run_at, attempts, max_attempts, idempotency_key,
+       request_hash, created_at, updated_at
+   )
+   VALUES (?, ?, ?, 'HTTP', ?::jsonb, ?, 'PENDING', ?, ?, 0, ?, ?, ?, now(), now())
+   ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+   DO NOTHING
+   RETURNING id;
+   ```
+3. **Canonical Request Hashing & 409 Conflict Semantics**:
+   - Every request computes a canonical SHA-256 hash of `METHOD\nURL\n[sorted header_k:header_v\n]\nBODY`.
+   - If `ON CONFLICT` returns 0 rows (the key was already used), the service loads the existing job:
+     - **Hashes Match**: Returns `200 OK` with the existing job response and an `Idempotent-Replayed: true` HTTP header.
+     - **Hashes Differ**: The client reused the same idempotency key for a distinct request. Returns `409 Conflict` (`"Idempotency key was previously submitted with a different request payload"`).
+
+---
+
+### 4.10 Data Access Strategy: JPA vs JdbcTemplate
+- **Spring Data JPA**: Used for domain entities, standard CRUD operations, user/key lookups, and paginated listing.
+- **Native SQL / JdbcTemplate**: Used specifically for the atomic `INSERT ... ON CONFLICT (user_id, idempotency_key) DO NOTHING RETURNING id` query and the Phase 3 worker claim query (`FOR UPDATE SKIP LOCKED`).
+  - *Rationale*: JPA / Hibernate lacks native support for PostgreSQL's `ON CONFLICT DO NOTHING RETURNING *` clause and `SKIP LOCKED` batch updates without risking lock escalation or ORM session caching inconsistencies.
+  - *Hibernate Configuration*: `spring.jpa.hibernate.ddl-auto` is set to `validate` to ensure Flyway remains the single source of truth for the database schema.
+
+---
+
+### 4.11 Ingestion Validation & Security Invariants
+- **CRLF Rejection**: Inbound header names and values are inspected for carriage return (`\r`) and line feed (`\n`) characters to prevent HTTP response splitting and header injection.
+- **Forbidden Headers**: Rejects client attempts to specify `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, or any header starting with `Proxy-*`.
+- **Payload Constraints**:
+  - URL length capped at 2,048 characters.
+  - Header count capped at 50 entries.
+  - Priority bounded between 0 and 10 (inclusive).
+  - Schedule `runAt` bounded to at most 365 days into the future.
+  - Body support is **UTF-8 text only** (capped at 64 KB, rejecting binary NUL bytes `\0`).
+- **SSRF Note in Code**: URL syntax validation (`URI.create`, scheme checks) verifies string structure only. It is **not** SSRF protection; SSRF defense is strictly performed during job execution in Phase 6 via pre-resolution IP validation.
+
+---
+
+### 4.12 Sensitive Data Logging Policy
+Application logs strictly record operational identifiers: `jobId`, `userId`, `queue`, `priority`, and high-level outcomes. **Headers and request/response bodies are never logged** to prevent leaking sensitive API tokens, bearer credentials, passwords, or PII.
+
+---
+
+### 4.13 Worker Threading Model: Platform Thread Pool vs Java 21 Virtual Threads + Semaphore
+
+#### The Architectural Decision
+A core design question for a job scheduler is how worker concurrency is managed:
+1. **Option A: Traditional Fixed Platform Thread Pool (`ThreadPoolExecutor`)**
+   - *Mechanics*: Each worker concurrency slot maps 1:1 to an operating system kernel thread (typically 1 MB native stack per thread).
+   - *Pros*: Predictable resource bounds; familiar debugging tools; thread-local storage isolation.
+   - *Cons*: OS thread allocation is heavy. When an HTTP job blocks waiting for a slow downstream server (e.g., 10–30 second timeouts), the kernel thread remains parked and idle, consuming OS memory and context-switching cycles. Scaling to 1,000 concurrent jobs requires ~1 GB of native stack memory alone.
+2. **Option B: Java 21 Virtual Threads + `Semaphore` Concurrency Limiter (OUR PICK)**
+   - *Mechanics*: Each claimed job is dispatched onto a Java 21 Virtual Thread via `Executors.newVirtualThreadPerTaskExecutor()`. Global worker concurrency is strictly bounded by a `java.util.concurrent.Semaphore`.
+   - *Pros*:
+     - Virtual threads are ultra-lightweight JVM user-mode threads (~few hundred bytes initial memory).
+     - When blocking on network I/O or sleep, the virtual thread is unmounted from its underlying carrier thread (ForkJoinPool worker), freeing CPU cores completely.
+     - Concurrency is explicitly bounded: `semaphore.availablePermits()` directly dictates how many jobs the poller claims from PostgreSQL in each iteration.
+     - Eliminates connection starvation and platform thread exhaustion.
+   - *Cons*: Pinning caveats if code synchronizes on native monitors (mitigated by using `ReentrantLock` and avoiding `synchronized` around blocking I/O).
+
+#### HikariCP Connection Pool Sizing vs Worker Concurrency
+A common fatal flaw in naive schedulers is sizing the database connection pool equal to worker concurrency (e.g. 100 workers = 100 DB connections). In our architecture:
+- Workers **never** hold a database connection while executing handlers.
+- A connection is borrowed only for the brief execution of the atomic claim query, immediately returned to HikariCP upon commit, and borrowed again briefly only during the fenced completion write.
+- As a result, a modest Hikari pool of **10 to 20 connections** comfortably supports **hundreds of concurrent worker virtual threads** with zero connection contention.
+
+---
+
+### 4.14 Atomic Claim Query & Plan Verification
+
+The worker claims jobs using a single atomic PostgreSQL statement:
+
+```sql
+UPDATE jobs
+SET status = 'RUNNING',
+    locked_by = :workerId,
+    locked_until = now() + (:leaseSeconds * INTERVAL '1 second'),
+    attempts = attempts + 1,
+    updated_at = now()
+WHERE id IN (
+    SELECT id FROM jobs
+    WHERE status = 'PENDING'
+      AND run_at <= now()
+    ORDER BY priority DESC, run_at ASC
+    LIMIT :batchSize
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+```
+
+#### Key Guarantees:
+1. **Single Time Authority**: All time comparisons (`run_at <= now()`) and lease deadlines (`now() + INTERVAL`) use PostgreSQL transaction timestamp `now()`. This guarantees clock consistency regardless of NTP drift across distributed worker nodes.
+2. **Deterministic Locking**: `FOR UPDATE SKIP LOCKED` inside the subquery ensures candidate rows are locked instantly. Other concurrent pollers skip locked rows without blocking.
+3. **Java-Side Ordering**: PostgreSQL `RETURNING *` does not preserve the `ORDER BY` of the inner subquery. Claimed jobs are explicitly sorted in Java by `priority DESC, run_at ASC` prior to dispatch.
+4. **Verified Query Plan (`EXPLAIN`)**:
+   Under PostgreSQL, the subquery leverages the partial index `idx_jobs_claim`:
+   ```text
+   Limit  (cost=0.14..8.17 rows=1 width=34)
+     ->  LockRows  (cost=0.14..8.17 rows=1 width=34)
+           ->  Index Scan using idx_jobs_claim on jobs  (cost=0.14..8.16 rows=1 width=34)
+                 Index Cond: (run_at <= now())
+                 Filter: ((status)::text = 'PENDING'::text)
+   ```
+
+---
+
+### 4.15 Off-Transaction Handler Execution & Hikari Pool Sizing
+
+A critical invariant of the worker engine:
+```text
+[ Poller Thread ] ──> Acquire Connection ──> Run Claim UPDATE ──> Commit & Release Connection
+                                                                               │
+                                                                               ▼
+                                                            [ Virtual Thread (Handler) ]
+                                                            NO Database Transaction
+                                                            NO JDBC Connection Held
+                                                            Outbound HTTP Execution (1s - 30s)
+                                                                               │
+                                                                               ▼
+[ Fenced Write ]  ──> Acquire Connection ──> Run Guarded UPDATE ──> Commit & Release Connection
+```
+
+- **Claim commits immediately**: The job status is persisted as `RUNNING` before the handler is invoked.
+- **Handlers run outside transactions**: During HTTP network delays, zero database connections are occupied.
+- **Completion is an isolated transaction**: The status update (`SUCCEEDED` or `FAILED`) runs in its own brief transaction.
+
+---
+
+### 4.16 Fencing Token Guard Against Zombie Workers
+
+Every completion or failure write in `JobClaimRepository` is strictly guarded:
+
+```sql
+UPDATE jobs
+SET status = 'SUCCEEDED',
+    last_error = NULL,
+    updated_at = now()
+WHERE id = :jobId
+  AND locked_by = :workerId
+  AND status = 'RUNNING';
+```
+
+- If a worker's lease expired or was reassigned to another node while it was paused, this query updates **0 rows**.
+- The repository logs a warning (`FENCING FAILURE`) and discards the result, preventing stale writes from corrupting fresh state.
+
+---
+
+### 4.17 Handler Contract & Extensibility
+
+The worker engine defines a clear strategy interface:
+
+```java
+public interface JobHandler {
+    String type();
+    JobExecutionResult execute(JobEntity job);
+}
+```
+
+- **Sealed Outcome Hierarchy**: `JobExecutionResult` is a sealed interface with permits `Success`, `RetryableFailure(String error)`, and `PermanentFailure(String error)`.
+- **Fail-Fast Registry**: `JobHandlerRegistry` registers handlers on startup and immediately throws `IllegalStateException` on duplicate type registrations.
+- **Unknown Job Types**: If a job specifies an unrecognized type, it is treated as a permanent failure (`markFailed`) with a diagnostic error message, never crashing the worker thread or engine.
+
+---
+
+### 4.18 Exponential Backoff with Full Jitter Formula & Math
+
+When an outbound HTTP request fails with a retryable condition (network partition, timeout, or downstream 5xx) and `attempts < max_attempts`, the scheduler reschedules the job instead of immediately failing.
+
+#### The Thundering Herd Problem:
+Naive retry schedulers use pure exponential backoff:
+$$\text{delay} = \text{base} \cdot 2^{\text{attempts}}$$
+If an external API goes down for 30 seconds, hundreds of failed requests calculate identical backoff schedules. When the downstream service recovers, all retrying workers hit the target server in massive, synchronized traffic spikes ("thundering herds"), repeatedly crashing the service again.
+
+#### The AWS Full Jitter Solution:
+To achieve optimal decorrelation and work spread, our engine implements **Exponential Backoff with Full Jitter**:
+$$\text{ceiling} = \min\left(\text{max\_backoff}, \text{base\_backoff} \cdot 2^{\text{attempts}}\right)$$
+$$\text{delay} = \text{random\_uniform}(1, \text{ceiling})$$
+
+- **Minimum Delay Guarantee**: $\text{delay} \ge 1$ second, guaranteeing that `run_at = now() + (delay * INTERVAL '1 second')` moves strictly into the future.
+- **Overflow Protection**: The bit-shift $1L \ll \min(\text{attempts}, 30)$ prevents 64-bit integer overflow for high attempt counts.
+
+---
+
+### 4.19 Dead-Letter Queue (DLQ) & Terminal Failure Semantics
+
+#### FAILED vs. DEAD Resolution:
+To eliminate ambiguity in monitoring dashboards, database indices, and alerting pipelines, we define the terminal failure semantics:
+- **`DEAD` (Single Terminal State / DLQ)**:
+  Any job that cannot be processed automatically belongs in the Dead-Letter Queue (`status = 'DEAD'`).
+  A job transitions to `DEAD` in two scenarios:
+  1. **Retry Exhaustion**: A retryable error occurred, but the job exhausted its retry budget (`attempts >= max_attempts`).
+  2. **Permanent Non-Retryable Failure**: The handler returned `PermanentFailure` (e.g., HTTP 400 Bad Request, malformed JSON body, invalid URL, or unknown handler type). Retrying is deterministic failure, so retries are short-circuited immediately to `DEAD`.
+- **Why avoid a lingering `FAILED` state**:
+  In a production scheduler, an operator needs a single query (`WHERE status = 'DEAD'`) to find all jobs requiring human intervention or replay. Having both `FAILED` and `DEAD` causes operational confusion and split metrics.
+
+#### Guarded DLQ Transition:
+```sql
+UPDATE jobs
+SET status = 'DEAD',
+    locked_by = NULL,
+    locked_until = NULL,
+    last_error = :error,
+    updated_at = now()
+WHERE id = :id AND locked_by = :workerId AND status = 'RUNNING';
+```
+
+---
+
+### 4.20 Lease Reaper Architecture & Multi-Instance Skip-Locked Sweeper
+
+#### The Problem: Hard Worker Crashes
+If a worker machine experiences sudden power loss, OS kernel panic, or an out-of-memory kill (`SIGKILL -9`), in-flight jobs remain stuck in `status = 'RUNNING'` with a past `locked_until` timestamp.
+
+#### The Self-Healing Sweeper:
+`LeaseReaper` is a scheduled background task that queries:
+```sql
+SELECT id, attempts, max_attempts
+FROM jobs
+WHERE status = 'RUNNING'
+  AND locked_until < now()
+ORDER BY locked_until ASC
+LIMIT :batchSize
+FOR UPDATE SKIP LOCKED;
+```
+
+1. **Partial Index Acceleration**: Evaluated instantly via `idx_jobs_reaper` on `(locked_until) WHERE status = 'RUNNING'`, avoiding full table scans.
+2. **Multi-Instance Safety**: `FOR UPDATE SKIP LOCKED` allows multiple scheduler instances to sweep concurrently without deadlocks or double-reclaiming.
+3. **Recovery Actions**:
+   - If `attempts < max_attempts`: Reset to `status = 'PENDING'`, `run_at = now()`, `locked_by = NULL`, `locked_until = NULL`, and log warning.
+   - If `attempts >= max_attempts`: Transition to `status = 'DEAD'`.
+
+---
+
+### 4.21 Heartbeat Protocol & AutoCloseable Resource Management
+
+#### The Problem: Slow Downstream Execution
+If a worker claims a job with a 30-second lease, but an external HTTP endpoint takes 25 seconds to respond, a slight delay could cause the `LeaseReaper` to assume the worker crashed and re-enqueue the job while it is still actively running.
+
+#### The Heartbeat Mechanism:
+While a handler runs on a virtual thread, `HeartbeatManager` schedules a background task every `leaseDuration / 3` seconds:
+```sql
+UPDATE jobs
+SET locked_until = now() + (:leaseDuration * INTERVAL '1 second'),
+    updated_at = now()
+WHERE id = :id AND locked_by = :workerId AND status = 'RUNNING';
+```
+- **AutoCloseable Pattern**: The heartbeat handle is managed via a try-with-resources block:
+  ```java
+  try (AutoCloseable heartbeat = heartbeatManager.startHeartbeat(job.getId(), workerId)) {
+      JobExecutionResult result = handler.execute(job);
+      // ...
+  }
+  ```
+  When execution finishes, the heartbeat is canceled automatically.
+- **Fenced Safety**: If the lease was already reassigned, the update affects 0 rows, and the heartbeat scheduler stops itself.
+
+---
+
+### 4.22 Graceful Shutdown Protocol
+
+When the application receives a termination signal (`SIGTERM` or Spring `@PreDestroy`):
+1. **Stop Polling**: `running.set(false)` is flagged, and the poller thread is interrupted to ensure zero new jobs are claimed.
+2. **Stop Heartbeats**: Active heartbeat timers are cancelled.
+3. **Await Virtual Threads**: The task executor awaits completion of in-flight jobs up to `scheduler.worker.shutdown-timeout-seconds` (default: 15s).
+4. **Clean Exit**: In-flight HTTP executions finish, write their fenced database results, and release HikariCP connections before the JVM terminates.
+
+---
+
+## 5. What Went Wrong & Engineering Resolutions
+
+During environment setup, Flyway migrations, and Phase 2 implementation, several real-world engineering hurdles were encountered and resolved:
+
+```text
+┌──────────────────────────────────────┐     ┌──────────────────────────────────────┐
+│ Initial Issue Encountered            │ ──> │ Engineering Diagnosis & Resolution   │
+└──────────────────────────────────────┘     └──────────────────────────────────────┘
+ 1. Maven compiler release 21 failure        Headless OpenJDK lacked javac. Automatically
+    ("error: release version 21 not          downloaded Eclipse Temurin 21 JDK into
+    supported").                             ~/.jdks and wired into mvnw JAVA_HOME.
+
+ 2. Testcontainers Docker connection error   Docker daemon requires root on Fedora.
+    ("Could not find a valid Docker env").   Discovered active user-level podman.socket
+                                             and configured ~/.testcontainers.properties.
+
+ 3. Ryuk Resource Reaper failure on Podman   Rootless Podman privileged socket constraint.
+    socket.                                  Configured testcontainers.ryuk.disabled=true
+                                             in ~/.testcontainers.properties.
+
+ 4. Compilation failure in Testcontainers    TestcontainersConfiguration class was
+    subpackages.                             package-private; made class and bean method
+                                             public.
+
+ 5. SELinux Permission Denied on bind-mount  Fedora container_t context blocked user_home_t.
+    data directory.                          Added :Z flag to docker-compose.yml volume.
+
+ 6. AutoConfigureMockMvc package relocation  Spring Boot 4 relocated package from
+    in Spring Boot 4.x.                      o.s.b.test.autoconfigure.web.servlet to
+                                             o.s.b.webmvc.test.autoconfigure. Updated imports.
+```
+
+1. **Missing `javac` in Fedora Headless JRE**:
+   - *Symptom*: Running `./mvnw test-compile` failed with `release version 21 not supported`.
+   - *Cause*: Fedora had `java-25-openjdk-headless` installed without `java-devel` (no `javac` in PATH).
+   - *Resolution*: Downloaded official Eclipse Temurin JDK 21.0.13+9 into `/home/ashutosh/.jdks/` and updated `backend/mvnw` to automatically export `JAVA_HOME` pointing to this JDK.
+2. **Docker Socket Access under Rootless Podman**:
+   - *Symptom*: Testcontainers failed with `IllegalStateException: Could not find a valid Docker environment`.
+   - *Cause*: Accessing `/var/run/docker.sock` requires root or docker group membership.
+   - *Resolution*: Enabled the user-level Podman API socket (`systemctl --user start podman.socket`) listening on `unix:///run/user/1000/podman/podman.sock` and created `/home/ashutosh/.testcontainers.properties` pointing `docker.host` directly to this socket.
+3. **Testcontainers Configuration Scope**:
+   - *Symptom*: Migration and Actuator tests in subpackages (`com.ashutosh.scheduler.migration`) failed compilation because `TestcontainersConfiguration` had default package-private visibility.
+   - *Resolution*: Explicitly modified `TestcontainersConfiguration` and its `PostgreSQLContainer` bean method to `public`.
+
+---
+
+## 6. Repository Exclusion Policy (.gitignore)
+
+The root [.gitignore](file:///home/ashutosh/Desktop/job-scheduler/.gitignore) strictly prevents committing sensitive, generated, or environment-specific files:
+
+```gitignore
+# 1. Database & Container Volumes
+# Never commit database binaries or transaction logs created with container UID/GID
+postgres_data/
+.docker/
+
+# 2. Environment Variables & Credentials
+# Never commit tunnel keys, database credentials, or API secret hashes
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# 3. Backend Build & Output Artifacts
+target/
+backend/target/
+*.class
+*.jar
+*.dump
+
+# 4. Frontend Build Artifacts
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.astro/
+frontend/.astro/
+
+# 5. IDE, Editors & OS Files
+.idea/
+*.iml
+.vscode/
+.DS_Store
+*.log
+```
+
+---
+
+## 7. Comprehensive Interview Defense & Technical Questions
+
+### Q1: Why use PostgreSQL as a queue instead of RabbitMQ or Kafka?
+**Interview Defense**:
+> "PostgreSQL is not a substitute for Kafka when processing hundreds of thousands of events per second with high partition parallelism. However, for a reliable HTTP scheduler processing delayed and recurring requests, Kafka introduces serious architectural mismatches:
+> 1. Kafka is an append-only distributed commit log; deleting, rescheduling, or updating an individual delayed message requires maintaining separate state stores or complex tombstone topologies.
+> 2. Relational queues eliminate the dual-write problem. When a user creates a job or cancels an account, job creation and state changes happen in the exact same ACID database transaction.
+> 3. Using PostgreSQL with `SKIP LOCKED` and partial indexes gives us lease management, priority ordering, and arbitrary delay scheduling natively with zero extra operational overhead."
+
+### Q2: How does `SELECT ... FOR UPDATE SKIP LOCKED` prevent race conditions and lock contention?
+**Interview Defense**:
+> "Traditional `SELECT ... FOR UPDATE` acquires an exclusive row-level lock on candidate rows. If Worker 1 claims Row A, Worker 2 attempting to claim Row A blocks and waits for Worker 1's transaction to commit or roll back, serializing throughput and risking deadlocks.
+> With `SKIP LOCKED`, PostgreSQL instructs the query planner to inspect the index, check if a candidate row is currently locked by another active transaction, and silently skip past it to lock the next eligible unlocked row. Multiple worker threads claim distinct batches of work simultaneously with zero lock contention and zero waiting."
+
+### Q3: What is the 'Zombie Worker' problem and how does our lease fencing pattern prevent corrupted state?
+**Interview Defense**:
+> "Suppose Worker A claims Job 1 with a 30-second lease. Downstream execution stalls, or Worker A suffers a 45-second Java 'Stop-the-World' garbage collection pause. While Worker A is paused, the Lease Reaper notices `locked_until < now()`, marks the lease expired, and assigns Job 1 to Worker B.
+> Worker B finishes the call and updates the status to `SUCCEEDED`. Suddenly, Worker A wakes up from its GC pause and blindly attempts to write its result.
+> To prevent dual-writes or overwriting fresh state with stale results, our write queries use fencing:
+> `UPDATE jobs SET status = :status WHERE id = :id AND locked_by = :workerId AND status = 'RUNNING'`.
+> Because Worker A's worker ID is no longer the active `locked_by`, the update affects 0 rows. Worker A detects the fencing failure, logs the incident, and discards its stale payload."
+
+### Q4: Why does UUIDv7 eliminate the B-Tree page split degradation caused by UUIDv4?
+**Interview Defense**:
+> "B-Trees require keys to be maintained in strictly sorted order. Because UUIDv4 is 128 bits of pseudo-random entropy, new keys are scattered uniformly across all leaf pages. Once the index size exceeds the memory cache, every insert triggers random disk I/O and causes mid-page splits, which allocate new 8 KB pages with only ~50% fill factors.
+> UUIDv7 uses a 48-bit millisecond Unix timestamp in its most significant bits. Successive IDs are monotonically increasing, meaning new keys are appended strictly to the right-most leaf page of the index. This guarantees near 100% leaf page fill factor, eliminates mid-page splits, and ensures only the newest leaf page must reside in PostgreSQL's `shared_buffers` cache."
+
+### Q5: Why must we store the HTTP request body as raw `TEXT` instead of `JSONB`?
+**Interview Defense**:
+> "PostgreSQL `JSONB` decomposes JSON into an internal structured binary format, discarding insignificant whitespace, reordering keys, and rejecting duplicate keys.
+> In webhook and HTTP scheduling, many target APIs require cryptographic signature verification (such as HMAC-SHA256 headers). These signatures are computed over the exact byte sequence transmitted by the client. If we re-serialize the payload from `JSONB`, key reordering and formatting changes invalidate the cryptographic signature. Additionally, storing raw text allows our scheduler to dispatch non-JSON content such as XML, CSV, form-encoded strings, or GraphQL."
+
+### Q6: How do you prevent an update-heavy queue table from causing debilitating PostgreSQL table and index bloat?
+**Interview Defense**:
+> "In PostgreSQL's MVCC model, an `UPDATE` writes a new row version and leaves the old version marked dead until vacuumed. In an active queue, every row is updated multiple times (`PENDING` $\to$ `RUNNING` $\to$ `SUCCEEDED`).
+> We mitigate bloat through three specific techniques:
+> 1. **HOT (Heap-Only Tuple) Optimization**: We set `fillfactor = 70` on the `jobs` table, leaving 30% free space per page. When updates don't touch indexed columns (or touch only partial indexes where the row drops out), the new tuple is stored on the same disk page, avoiding index updates completely.
+> 2. **Partial Indexing**: Indexes like `idx_jobs_claim` only index `WHERE status = 'PENDING'`. Terminal rows drop out of the index, keeping index trees small and memory-resident.
+> 3. **Aggressive Autovacuum Tuning**: We override table-level storage parameters with `autovacuum_vacuum_scale_factor = 0.02` (triggering after 2% row changes instead of 20%) and `autovacuum_vacuum_cost_limit = 1000` to ensure dead tuples are swept away continuously before disk fragmentation can accumulate."
+
+### Q7: Why must HTTP job handlers execute OUTSIDE of any database transaction, and what happens to HikariCP if you put `@Transactional` on the worker method?
+**Interview Defense**:
+> "If you wrap the worker's execution method in a database transaction (`@Transactional`), the thread holds an open JDBC connection checked out from the HikariCP pool for the entire duration of the outbound HTTP request.
+> External HTTP calls can take seconds to complete, or block for 10–30 seconds during timeouts. If 20 workers execute slow HTTP calls simultaneously under a Hikari pool size of 20, the connection pool is completely exhausted.
+> At that point, the entire application freezes: the Producer API cannot accept new jobs, Actuator health checks fail causing container restarts, and the poller cannot claim new work.
+> In our design, the claim query commits immediately (promptly releasing the checked-out connection). The handler runs completely disconnected from the database. When the HTTP call finishes, a fresh connection is borrowed briefly to write the fenced outcome and immediately returned."
+
+### Q8: Why do we use a single atomic `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)` instead of two separate queries (`SELECT ... FOR UPDATE` followed by `UPDATE`)?
+**Interview Defense**:
+> "A two-step approach requires an open transaction spanning two network roundtrips between the Spring Boot application and PostgreSQL:
+> 1. In Step 1 (`SELECT ... FOR UPDATE SKIP LOCKED`), PostgreSQL places row locks on the selected rows, but the transaction must remain open until Step 2 (`UPDATE jobs SET status='RUNNING'`) completes and commits.
+> 2. This triples transaction holding time and connection checkout duration. If the worker process experiences a JVM pause, thread stall, or network blip between the two statements, database locks remain held, blocking other operations and bloating uncommitted transaction counts.
+> By executing a single atomic statement, PostgreSQL locks the rows, updates their status, assigns the lease, increments attempts, and returns the modified tuples in one atomic operation within the database engine, requiring only a single roundtrip."
+
+### Q9: Why must all time comparisons (`run_at <= now()`, `locked_until = now() + INTERVAL`) use PostgreSQL `now()` rather than Java `Instant.now()`?
+**Interview Defense**:
+> "In a distributed or multi-container deployment, application worker nodes run on different physical machines or virtual instances. Even with NTP synchronization, clock drift of tens to hundreds of milliseconds is common; in worse scenarios (misconfigured NTP, leap seconds, VM migration), drift can reach several seconds.
+> If Worker A's clock is 5 seconds ahead of Worker B's clock, Worker A would prematurely expire leases granted by Worker B, causing lease thrashing and duplicate job execution.
+> By designating PostgreSQL as the single source of truth for time (`now()`), all claim evaluations, lease durations, and retry deadlines are anchored to PostgreSQL's transaction clock, rendering application-level clock skew completely irrelevant."
+
+### Q10: Why is 'Full Jitter' mathematically superior to pure exponential backoff or equal jitter in distributed schedulers?
+**Interview Defense**:
+> "Under pure exponential backoff ($\text{delay} = \text{base} \cdot 2^{\text{attempt}}$), when a downstream service suffers an outage, all failed requests calculate identical retry schedules. As a result, all retrying workers attack the recovering server in massive, synchronized waves of traffic — known as the 'thundering herd' problem.
+> Adding 'Equal Jitter' ($\text{delay} = \frac{\text{ceiling}}{2} + \text{random}(0, \frac{\text{ceiling}}{2})$) introduces some randomness, but still concentrates traffic in the upper half of the interval.
+> Under 'Full Jitter' ($\text{delay} = \text{random}(1, \text{ceiling})$), retries are uniformly distributed across the entire timeline $[1, \text{ceiling}]$. Amazon's distributed systems research showed that Full Jitter produces the lowest server load variance, the lowest client wait time, and virtually zero thundering herd clustering, giving recovering downstream systems the highest probability of recovery."
+
+### Q11: How does the Lease Reaper distinguish between a legitimately slow job and a crashed worker node?
+**Interview Defense**:
+> "The scheduler uses a Heartbeat Protocol. When a worker claims a job with a 30-second lease, a background timer inside that worker automatically sends an atomic heartbeat every 10 seconds (`leaseDuration / 3`), executing:
+> `UPDATE jobs SET locked_until = now() + INTERVAL '30 seconds' WHERE id = :id AND locked_by = :workerId AND status = 'RUNNING'`.
+> As long as the worker is alive and actively waiting for a slow downstream response, it continuously advances `locked_until`.
+> If the worker machine suddenly crashes (OOM kill, kernel panic, power cut), the heartbeat dies instantly. Once 30 seconds pass, `locked_until < now()`.
+> The `LeaseReaper` background sweeper detects the expired timestamp using partial index `idx_jobs_reaper`, confirms the worker stopped heartbeating, and re-queues the job to `PENDING` (or transitions it to `DEAD` if `attempts >= max_attempts`) without human intervention."
+
+### Q12: Why do permanent errors (like HTTP 400 Bad Request) transition directly to `DEAD` instead of undergoing retry attempts?
+**Interview Defense**:
+> "In distributed systems, failures are divided into two distinct classes:
+> 1. **Transient / Retryable Failures**: Caused by temporary conditions like network timeouts, DNS hiccups, or downstream 503/504 server overload. Retrying later has a high probability of success.
+> 2. **Deterministic / Permanent Failures**: Caused by invalid inputs, such as malformed JSON syntax, HTTP 400 Bad Request, invalid authentication credentials, or targeting an unknown route.
+> Because the input payload is immutable, resending an invalid JSON payload 3 or 5 times will deterministically fail 3 or 5 times. Retrying permanent errors wastes CPU cycles, database I/O, and outbound network bandwidth, while potentially triggering downstream rate limiters or security blocks. Therefore, permanent failures are immediately short-circuited to `DEAD` (DLQ) with an explicit error message recorded."
+
+

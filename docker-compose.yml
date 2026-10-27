@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: job-scheduler-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-scheduler}
+      POSTGRES_USER: ${DB_USER:-scheduler}
+      POSTGRES_PASSWORD: ${DB_PASS:-scheduler}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data:Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-scheduler} -d ${DB_NAME:-scheduler}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+        -c shared_buffers=256MB
+        -c max_connections=100
+        -c autovacuum_vacuum_cost_limit=1000
+        -c autovacuum_vacuum_cost_delay=2ms
